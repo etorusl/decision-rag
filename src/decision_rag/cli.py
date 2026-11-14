@@ -53,6 +53,15 @@ def model_args(p):
 
 def _benchmark(args, reporter):
     from .evaluation import evaluate
+    if args.query_concurrency < 1:
+        raise ValueError('--query-concurrency must be positive')
+    if args.execution_mode == 'latency' and args.query_concurrency != 1:
+        raise ValueError('Use --execution-mode throughput for --query-concurrency greater than 1')
+    if args.execution_mode == 'throughput':
+        if args.method == 'decision' and args.backend not in {'vllm', 'smoke'}:
+            raise ValueError('Concurrent decision evaluation requires --backend vllm (or synthetic smoke)')
+        if args.method in {'dense', 'dense-rerank'} and args.engine != 'vllm':
+            raise ValueError('Concurrent dense evaluation requires --engine vllm')
     initialization_start = time.perf_counter()
     with reporter.phase('Load corpus and queries', total=2, unit='file') as phase:
         corpus = Corpus.load(args.corpus)
@@ -127,14 +136,48 @@ def _benchmark(args, reporter):
                                        search_device=args.search_device)
             config = {**vars(args), 'runtime': retriever.runtime_metadata}
         phase.update()
+    worker_factory = None
+    if args.execution_mode == 'throughput':
+        if args.method == 'decision':
+            # Each concurrent conversation has private memory and per-query cache salt.
+            # Model weights remain in the single vLLM server on the selected GPU.
+            first_worker = True
+            def worker_factory():
+                nonlocal first_worker
+                if first_worker:
+                    first_worker = False
+                    return retriever
+                worker_backend = backend_from_args(args)
+                try:
+                    return DecisionRetriever(corpus, worker_backend, cfg)
+                except BaseException:
+                    if hasattr(worker_backend, 'close'):
+                        worker_backend.close()
+                    raise
+        else:
+            # Stateless HTTP clients and the read-only GPU index are shared. Index
+            # memory must not grow with the number of concurrent conversations.
+            worker_factory = lambda: retriever
+    evaluation_failed = False
     try:
         result = evaluate(retriever, queries, args.output, warmup=args.warmup,
                           config=config, source_paths=[args.corpus,args.queries], dedup_text=args.dedup_text,
                           initialization_seconds=time.perf_counter() - initialization_start,
-                          gpu_monitor_index=args.gpu_monitor_index, reporter=reporter)
+                          gpu_monitor_index=args.gpu_monitor_index, reporter=reporter,
+                          execution_mode=args.execution_mode, query_concurrency=args.query_concurrency,
+                          worker_factory=worker_factory)
+    except BaseException:
+        evaluation_failed = True
+        raise
     finally:
-        if hasattr(retriever, "close"):
-            retriever.close()
+        try:
+            if hasattr(retriever, "close"):
+                retriever.close()
+        except BaseException:
+            if not evaluation_failed:
+                # A failed cleanup must not look like a successful complete run.
+                (Path(args.output) / 'summary.json').unlink(missing_ok=True)
+                raise
     return result
 
 
@@ -149,7 +192,7 @@ def main(argv=None):
     prep.add_argument('--limit', type=int)
     demo = subs.add_parser('demo', help='Generate tiny synthetic smoke data')
     demo.add_argument('--output', default='data/demo')
-    bench = subs.add_parser('benchmark', help='Measure retrieval quality and serial end-to-end latency')
+    bench = subs.add_parser('benchmark', help='Measure retrieval quality, latency or concurrent throughput')
     bench.add_argument('--corpus', required=True)
     bench.add_argument('--queries', required=True)
     bench.add_argument('--output', required=True)
@@ -162,6 +205,9 @@ def main(argv=None):
     bench.add_argument('--max-request-tokens', type=int)
     bench.add_argument('--max-candidates', type=int, default=10000)
     bench.add_argument('--concurrency', type=int, default=1)
+    bench.add_argument('--execution-mode', choices=['latency', 'throughput'], default='latency')
+    bench.add_argument('--query-concurrency', type=int, default=1,
+                       help='Maximum simultaneous conversations in throughput mode; turns stay sequential')
     bench.add_argument('--no-memory', action='store_true')
     bench.add_argument('--independent', action='store_true', help='Ablation: one candidate per context')
     bench.add_argument('--limit', type=int)

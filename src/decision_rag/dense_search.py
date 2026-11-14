@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import time
 from contextlib import contextmanager
 
 import numpy as np
+
+_MATMUL_PRECISION_LOCK = threading.RLock()
 
 
 def resolve_search_device(device):
@@ -58,18 +61,25 @@ def stable_torch_top_k(scores, k):
 
 
 @contextmanager
-def _ieee_matmul(torch):
-    """Use the version-appropriate precision API without changing caller policy."""
-    matmul = torch.backends.cuda.matmul
-    # New 2.9 controls must not be mixed with the legacy 2.7 allow_tf32 flag.
-    field = 'fp32_precision' if hasattr(matmul, 'fp32_precision') else 'allow_tf32'
-    previous = getattr(matmul, field)
-    setattr(matmul, field, 'ieee' if field == 'fp32_precision' else False)
-    try:
-        with torch.autocast(device_type='cuda', enabled=False):
-            yield
-    finally:
-        setattr(matmul, field, previous)
+def _ieee_matmul(torch, *, device=None):
+    """Serialize the global precision policy until this search's CUDA work finishes."""
+    with _MATMUL_PRECISION_LOCK:
+        matmul = torch.backends.cuda.matmul
+        # New 2.9 controls must not be mixed with the legacy 2.7 allow_tf32 flag.
+        field = 'fp32_precision' if hasattr(matmul, 'fp32_precision') else 'allow_tf32'
+        previous = getattr(matmul, field)
+        setattr(matmul, field, 'ieee' if field == 'fp32_precision' else False)
+        try:
+            with torch.autocast(device_type='cuda', enabled=False):
+                try:
+                    yield
+                finally:
+                    # Also drain queued work on errors before another thread changes
+                    # the process-wide policy or starts searching the shared index.
+                    if device is not None:
+                        torch.cuda.synchronize(device)
+        finally:
+            setattr(matmul, field, previous)
 
 
 class ExactDenseIndex:
@@ -140,7 +150,7 @@ class ExactDenseIndex:
         import torch
 
         try:
-            with torch.inference_mode(), _ieee_matmul(torch):
+            with torch.inference_mode(), _ieee_matmul(torch, device=self.device):
                 if isinstance(query, torch.Tensor):
                     if query.device != self._index.device:
                         raise ValueError('Tensor query must be on the search index device')
@@ -160,7 +170,6 @@ class ExactDenseIndex:
                 # complete before return, so the outer wall timer includes CUDA work.
                 selected_scores = scores[ranking].cpu().numpy()
                 selected_ids = ranking.cpu().numpy()
-                torch.cuda.synchronize(self.device)
                 return selected_ids, selected_scores
         except torch.OutOfMemoryError as exc:
             raise RuntimeError(self._memory_error('score a query')) from exc

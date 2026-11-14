@@ -114,6 +114,38 @@ def test_reporter_handles_missing_fields_and_invalid_input(tmp_path):
         reporter.flatten_summary(path)
 
 
+def test_concurrent_report_keeps_wall_throughput_distinct_from_serial_qps(tmp_path):
+    path = write_summary(tmp_path / 'multidoc2dial/dense-bge-vllm')
+    summary = json.loads(path.read_text())
+    summary['config'] = {'method': 'dense', 'model': 'BAAI/bge-m3', 'engine': 'vllm'}
+    summary['latency'].pop('serial_queries_per_second')
+    summary['execution'] = {'mode': 'throughput', 'query_concurrency': 8,
+                            'effective_query_concurrency': 4, 'observed_query_concurrency': 4}
+    summary['throughput'] = {'queries_per_second': 12.0, 'wall_seconds': 1 / 3,
+                             'successful_queries': 4, 'failed_queries': 0}
+    summary['gpu_telemetry'] = {'mean_utilization_percent': 85.5}
+    path.write_text(json.dumps(summary))
+    row = reporter.flatten_summary(path)
+    assert row['throughput.queries_per_second'] == 12.0
+    assert row['throughput.wall_seconds'] == 1 / 3
+    assert 'latency.serial_queries_per_second' not in row
+    assert row['gpu_mean_utilization_percent'] == 85.5
+    text = reporter.markdown_text([row])
+    for table in ('Quality', 'Efficiency', 'Protocol'):
+        section = text.split(f'## {table}\n', 1)[1].split('\n## ', 1)[0]
+        assert 'BAAI/bge-m3' in section and '(throughput, C=8)' in section
+        assert '[multidoc2dial/dense-bge-vllm]' in section
+    assert 'Wall queries/s' in text and 'Peak active queries' in text
+    exported = next(csv.DictReader(io.StringIO(reporter.csv_text([row]))))
+    assert exported['execution_mode'] == 'throughput'
+    assert exported['query_concurrency'] == '8'
+    assert exported['effective_query_concurrency'] == exported['observed_query_concurrency'] == '4'
+    # Older runs stay explicitly labeled as serial latency measurements.
+    legacy = reporter.flatten_summary(write_summary(tmp_path / 'old-run'))
+    assert legacy['execution_mode'] == 'latency' and legacy['query_concurrency'] == 1
+    assert legacy['throughput.queries_per_second'] is None
+
+
 @pytest.mark.parametrize('choice_k,run_type', [(0, 'naive binary'), (20, 'naive choice')])
 def test_decision_rows_include_actual_model_in_every_table_and_csv(tmp_path, choice_k, run_type):
     source = write_summary(tmp_path / 'pages-3')

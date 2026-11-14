@@ -57,7 +57,9 @@ def paired_bootstrap(a: Sequence[dict], b: Sequence[dict], metric="recall@10", s
     if left.keys() != right.keys():
         raise ValueError("Paired runs must contain identical query IDs")
     groups = defaultdict(list)
-    for qid, l in left.items():
+    # Concurrent runs write completion order; seeded bootstrap must not depend on it.
+    for qid in sorted(left):
+        l = left[qid]
         r = right[qid]
         if l.get('conversation_id') != r.get('conversation_id'):
             raise ValueError('Conversation IDs differ between paired runs')

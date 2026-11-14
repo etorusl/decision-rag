@@ -21,3 +21,12 @@ def test_bootstrap_is_paired_and_deterministic():
     assert paired_bootstrap(a,b,'hit@1',20)['ci95'] == [1,1]
     with pytest.raises(ValueError):
         paired_bootstrap(a,[])
+
+
+def test_seeded_bootstrap_is_independent_of_concurrent_completion_order():
+    a = [{'query_id': str(i), 'conversation_id': f'dialog-{i // 2}',
+          'metrics': {'recall@10': i / 12}} for i in range(12)]
+    b = [{**row, 'metrics': {'recall@10': .5}} for row in a]
+    expected = paired_bootstrap(a, b, samples=101, seed=7)
+    actual = paired_bootstrap(a[::-1], b[::2] + b[1::2], samples=101, seed=7)
+    assert actual == expected

@@ -1,5 +1,9 @@
 """Exact top-k parity and explicit placement, with CUDA coverage when available."""
 import builtins
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -61,6 +65,68 @@ def test_precision_policy_is_restored_after_failure():
         setattr(matmul, field, original)
 
 
+@pytest.mark.parametrize('field,original,expected', [('allow_tf32', True, False),
+                                                   ('fp32_precision', 'tf32', 'ieee')])
+@pytest.mark.parametrize('fail_body', [False, True])
+def test_precision_lock_covers_completed_cuda_work_across_threads(field, original, expected, fail_body):
+    matmul = SimpleNamespace(**{field: original})
+    first_sync, finish_sync, second_attempted, second_entered = (threading.Event() for _ in range(4))
+    synced = []
+
+    def synchronize(device):
+        assert getattr(matmul, field) == expected
+        synced.append(device)
+        if len(synced) == 1:
+            first_sync.set()
+            assert finish_sync.wait(timeout=5)
+
+    torch = SimpleNamespace(backends=SimpleNamespace(cuda=SimpleNamespace(matmul=matmul)),
+                            cuda=SimpleNamespace(synchronize=synchronize),
+                            autocast=lambda **kwargs: nullcontext())
+
+    def first():
+        with _ieee_matmul(torch, device='cuda:0'):
+            assert getattr(matmul, field) == expected
+            if fail_body:
+                raise RuntimeError('search failed after submitting CUDA work')
+
+    def second():
+        second_attempted.set()
+        with _ieee_matmul(torch, device='cuda:0'):
+            second_entered.set()
+            assert getattr(matmul, field) == expected
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_result = pool.submit(first)
+        try:
+            assert first_sync.wait(timeout=5)
+            second_result = pool.submit(second)
+            assert second_attempted.wait(timeout=5)
+            assert not second_entered.wait(timeout=.05)
+        finally:
+            finish_sync.set()
+        if fail_body:
+            with pytest.raises(RuntimeError, match='search failed'):
+                first_result.result(timeout=5)
+        else:
+            first_result.result(timeout=5)
+        second_result.result(timeout=5)
+    assert synced == ['cuda:0', 'cuda:0']
+    assert getattr(matmul, field) == original
+
+
+def test_precision_policy_restored_when_cuda_synchronization_fails():
+    matmul = SimpleNamespace(allow_tf32=True)
+    def fail(device):
+        raise RuntimeError('CUDA execution failed')
+    torch = SimpleNamespace(backends=SimpleNamespace(cuda=SimpleNamespace(matmul=matmul)),
+                            cuda=SimpleNamespace(synchronize=fail),
+                            autocast=lambda **kwargs: nullcontext())
+    with pytest.raises(RuntimeError, match='CUDA execution failed'), _ieee_matmul(torch, device='cuda:0'):
+        assert matmul.allow_tf32 is False
+    assert matmul.allow_tf32 is True
+
+
 @pytest.mark.parametrize('vectors', [np.empty((0, 2)), np.ones(3), np.array([[np.nan, 1]]),
                                     np.array([[np.inf, 1]])])
 def test_index_rejects_invalid_vectors(vectors):
@@ -100,5 +166,12 @@ def test_cuda_resident_index_matches_cpu_with_stable_ties():
     tensor_ids, tensor_scores = gpu.search(torch.from_numpy(query).to(gpu.device), 2)
     assert tensor_ids.tolist() == [0, 2]
     np.testing.assert_allclose(tensor_scores, [1, 1])
+    queries = [query, np.array([0, 1], dtype=np.float32)] * 4
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        concurrent = list(pool.map(lambda vector: gpu.search(vector, 3), queries))
+    for vector, (indices, scores) in zip(queries, concurrent, strict=True):
+        expected_ids, expected_scores = cpu.search(vector, 3)
+        assert indices.tolist() == expected_ids.tolist()
+        np.testing.assert_allclose(scores, expected_scores, rtol=1e-6, atol=1e-7)
     gpu.close()
     assert gpu._index is None

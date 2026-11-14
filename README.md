@@ -33,7 +33,8 @@ python scripts/download_models.py --manifest cache/model-manifest.json
 
 # Семь систем, первые 100 запросов, полный корпус:
 # BM25 / Qwen dense и dense+reranker / BGE dense и dense+reranker / naive binary и choice
-bash scripts/benchmark_h100.sh multidoc2dial 100 --model-manifest cache/model-manifest.json
+bash scripts/benchmark_h100.sh multidoc2dial 100 --model-manifest cache/model-manifest.json \
+  --execution-mode throughput --query-concurrency 8
 
 # Полные бенчмарки без обучения
 bash scripts/benchmark_h100.sh multidoc2dial all --model-manifest cache/model-manifest.json
@@ -42,6 +43,12 @@ bash scripts/benchmark_h100.sh conditionalqa all --model-manifest cache/model-ma
 
 Сначала запускайте короткую выборку. Скрипт сам поднимает и останавливает локальные vLLM-серверы;
 для готовых моделей training-этапа нет. Установка vLLM изолирована в `.venv-vllm`.
+Runner по умолчанию выполняет до 8 retrieval-запросов параллельно на одной GPU 1.
+Независимые диалоги идут одновременно, turns одного диалога — последовательно.
+Это начальный throughput-профиль, не измеренный максимум H100. Для прежнего последовательного
+измерения задайте `--execution-mode latency --query-concurrency 1`; прямой `decision-rag benchmark`
+по умолчанию остаётся последовательным. Batching может изменить сравнение методов по времени;
+ускорение нужно измерить. Команды sweep concurrency 1/2/4/8/16 — в [инструкции запуска](docs/run-benchmarks.md).
 Предварительное скачивание фиксирует SHA и проверяет файлы всех пяти моделей. С manifest
 модельные процессы используют локальный HF cache без сети; данные скачиваются отдельно.
 Исходные Qwen-прогоны сохранены, к ним добавлены `BAAI/bge-m3` и
@@ -72,10 +79,11 @@ NQ требует большого исходного DAPR-корпуса и о�
 [данные](docs/datasets.md), [NQ](docs/natural-questions.md), [дополнительные проверки](docs/benchmarks-extra.md).
 MTRAG использует официальные gold labels: расширенные GPT-5 labels из статьи нам не даны.
 
-Для скорости сохраняются p50/p90/p95/p99, serial QPS, пиковая память CUDA,
+Для скорости сохраняются p50/p90/p95/p99, режим/concurrency, wall-clock QPS, пиковая память CUDA,
 число HTTP-запросов, logical sequences, tokens и времена этапов. Внутренние vLLM forward passes
 не наблюдаются и отмечаются `null`; sampled GPU memory измеряется через `nvidia-smi`. Измерение включает весь retrieval
 после загрузки модели/корпуса; общее время инициализации/индексирования и время прогрева записываются отдельно.
+В throughput latency измеряется под нагрузкой; serial QPS относится к последовательному режиму.
 Компиляция новых форм запросов может остаться внутри измеряемых запросов.
 Каждый запуск пишет `queries.jsonl` и `summary.json`, commit SHA, версии и SHA256 входов.
 Результаты и веса не коммитятся.

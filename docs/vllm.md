@@ -55,9 +55,57 @@ checkpoints до запуска эксперимента и записывает
 | Naive binary | Qwen/Qwen3-8B | — |
 | Naive choice | Qwen/Qwen3-8B | выбор через ту же Qwen/Qwen3-8B |
 
-Исходные пять вариантов и их параметры сохранены. `--skip-bge` возвращает исходную матрицу;
+Исходные пять вариантов, модели и retrieval budgets сохранены. `--skip-bge` возвращает исходную матрицу;
 по умолчанию выполняются все семь. Дополнительные BGE-прогоны используют dense-векторы BGE-M3,
 без sparse/ColBERT-гибрида и без смешивания эмбеддеров и реранкеров разных семейств.
+
+## Параллельные запросы и batching
+
+Runner и shell-скрипты по умолчанию используют `--execution-mode throughput --query-concurrency 8`:
+несколько независимых retrieval-запросов одновременно подают работу одному vLLM engine.
+Все методы используют одинаковый лимит параллельных запросов. Внутри каждого диалога
+следующий turn ждёт предыдущий; разные диалоги могут выполняться параллельно. Это closed-loop
+нагрузка без заданной частоты поступления: освободившийся worker берёт следующую работу.
+Восемь запросов — стартовый профиль, оптимум на H100 ещё не измерен.
+В throughput каждый логический worker прогревается двумя запросами; в latency прогрев
+содержит два запроса всего. Для более короткой выборки используется её длина.
+Фактическое число warmup-запросов записывается в summary и исключается из wall-clock QPS.
+Прогрев разных workers использует общий GPU-индекс без повторного создания индекса.
+
+`--execution-mode latency --query-concurrency 1` воспроизводит последовательный профиль
+с прежними scheduler limits. Если concurrency не указана, latency выбирает 1 автоматически;
+значение выше 1 для этого режима отклоняется. Прямой `decision-rag benchmark` по умолчанию
+остаётся в latency/1; throughput нужно включить явно. Семь методов suite запускаются
+последовательно, поэтому разные методы не конкурируют друг с другом за GPU 1.
+
+| Параметр runner | Throughput default | Latency default | Назначение |
+| --- | --- | --- | --- |
+| `--query-concurrency` | 8 | 1 | Максимум активных retrieval-запросов |
+| `--decision-max-num-seqs` | 128 | 64 | Sequence cap decision scheduler |
+| `--pool-max-num-seqs` | 64 | 16 | Sequence cap каждого pooling scheduler |
+| `--decision-max-num-batched-tokens` | 32768 | 32768 | Tokens за scheduler iteration; auto = max(16384, decision context) |
+| `--pool-max-num-batched-tokens` | 16384 | 16384 | Auto = max(16384, context конкретного Qwen/BGE сервера) |
+| `--vllm-batch-size` | 64 | 64 | Decision sequences в одном HTTP-запросе |
+| `--batch-size` | 16 | 16 | Embedding/reranker inputs в одном HTTP-запросе |
+
+Query concurrency, число sequences и HTTP batch size — разные ограничения. Один retrieval
+может отправить несколько HTTP-запросов, а один HTTP-запрос содержит несколько sequences.
+Runner не увеличивает вложенную concurrency внутри decision scoring. Увеличение scheduler
+limit без достаточной клиентской нагрузки само по себе не ускоряет модель. У BGE отключён
+chunked prefill, поэтому pooling token budget должен быть не меньше BGE context limit.
+Слишком большой batch/лимит может увеличить latency или привести к OOM.
+
+Бюджеты `--decision-memory .85` и `--pool-memory .40` остаются прежними: это доли VRAM,
+не проценты вычислительной загрузки. В throughput память модели и GPU-индекс не размножаются
+на число запросов. Дополнительные активные запросы требуют рабочей памяти и KV cache.
+Все выбранные параметры записываются в конфигурацию; фактические команды серверов — в logs.
+
+Примеры latency/8-way throughput и sweep concurrency 1/2/4/8/16 с отдельными tags:
+[полные команды](run-benchmarks.md). При sweep сохраняйте revision, корпус, prompts,
+page/candidate budgets, cache policy и precision; после изменения batching проверяйте качество.
+Параллельный режим может поменять порядок методов по скорости, но не гарантирует ускорения.
+
+## Артефакты и дополнительные параметры
 
 Скрипт не завершает чужие процессы: занятый порт приводит к явной ошибке. Логи и точные
 команды серверов находятся в `results/RUN/DATASET/servers/`, revisions — в `server-config.json`.
@@ -140,6 +188,9 @@ embedding/reranker продолжают работать в BF16. CPU-поиск
 
 ## Что именно измеряется
 
+- **Режим нагрузки:** latency измеряет один последовательный запрос; throughput — задержку
+  запроса под нагрузкой и wall-clock QPS всего измеренного прогона. Сумма длительностей
+  параллельных запросов не равна wall time. Сравнение режимов и concurrency выполняйте отдельно.
 - **Весь online retrieval:** построение prompts, токенизация, localhost HTTP, очередь vLLM,
   prefill/one-token scoring, поиск по embeddings и все этапы навигации. Загрузка серверов,
   offline corpus embedding и прогрев исключены из per-query timer.
@@ -180,7 +231,8 @@ CSV/Markdown-сводка отдельно показывает устройст
 в каталоге каждого метода — собственные `run.log`, `events.jsonl`, `queries.jsonl` и `summary.json`.
 Traceback при ошибке остаётся в логах. stdout/stderr серверов vLLM находятся в `servers/*.log`
 и `servers/bge/*.log`.
-Логирование и обновление progress bar выполняются вне измеряемого retrieval-интервала.
+Логирование и обновление progress bar выполняются вне индивидуального retrieval-интервала;
+их orchestration overhead входит в wall-clock throughput.
 
 `--progress auto` — значение по умолчанию; `on` принудительно включает bars,
 `off` оставляет обычные строки. Без TTY (например, `nohup` или перенаправление в файл)

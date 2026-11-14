@@ -65,7 +65,8 @@ offline-режим Hugging Face для серверов и модельных к
 
 ```bash
 bash scripts/benchmark_h100.sh multidoc2dial 100 \
-  --model-manifest cache/model-manifest.json
+  --model-manifest cache/model-manifest.json \
+  --execution-mode throughput --query-concurrency 8
 ```
 
 | Каталог прогона | Метод | Модель / embedder | Reranker |
@@ -78,8 +79,9 @@ bash scripts/benchmark_h100.sh multidoc2dial 100 \
 | `naive-binary-vllm` | naive binary | `Qwen/Qwen3-8B` | — |
 | `naive-choice-vllm` | naive choice | `Qwen/Qwen3-8B` | — |
 
-Прежние пять вариантов сохраняют свои настройки и имена каталогов. `--skip-bge` позволяет
-запустить только их. BGE использует dense-векторы; sparse и ColBERT-выходы BGE-M3 здесь
+Прежние пять вариантов сохраняют модели, retrieval budgets и имена каталогов. `--skip-bge`
+позволяет запустить только их; прежний последовательный профиль доступен через
+`--execution-mode latency --query-concurrency 1`. BGE использует dense-векторы; sparse и ColBERT-выходы BGE-M3 здесь
 не участвуют. BGE получает обычный запрос и документ без Qwen-инструкций.
 
 GPU выполняет нейросетевой инференс, dense dot products/top-k и численную часть BM25.
@@ -88,10 +90,35 @@ Qwen и BGE pooling-серверы запускаются последовате
 и reranker могут работать одновременно. После pooling-прогонов они останавливаются, затем
 запускается `Qwen3-8B`. Не запускайте несколько suites одновременно на GPU 1 для сравнения времени.
 
-Общие настройки: top-20 результатов, 100 кандидатов для rerank, batch size 16,
-два warmup-запроса. Dense-поиск — точный FP32 на GPU. Pooling context limit — 8192
+Общие настройки: top-20 результатов, 100 кандидатов для rerank, batch size 16.
+Прогрев: два запроса на каждый логический worker в throughput и два всего в latency
+(на короткой выборке число ограничено её длиной). Фактическое число записывается в summary;
+warmup не входит в wall-clock QPS. GPU-индекс при этом остаётся общим.
+Dense-поиск — точный FP32 на GPU. Pooling context limit — 8192
 для обеих пар; BGE имеет отдельный параметр `--bge-max-model-len` (не более 8192),
 Qwen — `--pool-max-model-len`. Контекст decision-модели — 32768.
+
+Runner по умолчанию использует **throughput с максимум восемью активными запросами**
+для каждого из семи методов. Это начальный профиль для H100, а не измеренный оптимум.
+Новый запрос запускается после завершения предыдущего на освободившемся worker
+(closed-loop нагрузка). Независимые диалоги идут параллельно, turns каждого диалога —
+строго по порядку. Если независимых диалогов меньше восьми, реальная параллельность ниже.
+Веса моделей и GPU-индекс общие; query concurrency не создаёт восемь vLLM-серверов.
+
+Для измерения задержки одного запроса используйте отдельный run tag:
+
+```bash
+bash scripts/benchmark_h100.sh multidoc2dial 100 \
+  --model-manifest cache/model-manifest.json \
+  --execution-mode latency --query-concurrency 1 \
+  --run-tag "latency-$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
+Throughput-отчёт показывает **latency под нагрузкой** и **wall-clock QPS**: число
+завершённых запросов, делённое на длительность измеренного прогона. Это не обратная
+величина среднего времени запроса. Изменение batching может изменить относительную
+скорость методов; ускорение каждого метода не гарантировано. Сравнивайте одинаковые
+execution mode и query concurrency; latency и throughput — отдельные эксперименты.
 
 ## 4. Полные прогоны и единый отчёт
 
@@ -107,6 +134,7 @@ bench_tag="qwen-bge-$(date -u +%Y%m%dT%H%M%SZ)"
   for bench_dataset in multidoc2dial conditionalqa mtrag scifact; do
     bash scripts/benchmark_h100.sh "$bench_dataset" all \
       --model-manifest cache/model-manifest.json \
+      --execution-mode throughput --query-concurrency 8 \
       --run-tag "$bench_tag"
   done
   .venv-vllm/bin/python scripts/summarize_runs.py "results/$bench_tag" \
@@ -132,12 +160,34 @@ bench_tag="qwen-bge-$(date -u +%Y%m%dT%H%M%SZ)"
 
 Сравнивайте качество и время внутри одного датасета, с одинаковыми SHA входов,
 query limit, top-k и candidate budget. Отчёт показывает quality-метрики,
-latency/serial QPS, доступные token usage и пиковую занятую VRAM по GPU.
+режим и concurrency, latency, wall-clock QPS, доступные token usage и пиковую занятую VRAM по GPU.
+Serial QPS относится только к последовательному профилю.
 Загрузка весов, построение индекса и warmup не входят в измеренную latency запроса.
 Для dense в данных по запросам отдельно сохранены время embedding и GPU-поиска.
 Это retrieval-бенчмарк: генерация финального ответа и её качество здесь не измеряются.
 
 ## 5. Дополнительные прогоны
+
+Подбор query concurrency на одной и той же выборке; suites запускаются последовательно,
+каждая настройка получает собственный tag. Scheduler limits и retrieval budgets остаются
+одинаковыми во всех пяти throughput-прогонах, включая concurrency 1:
+
+```bash
+sweep_tag="h100-concurrency-$(date -u +%Y%m%dT%H%M%SZ)"
+(
+  set -e
+  for query_concurrency in 1 2 4 8 16; do
+    bash scripts/benchmark_h100.sh multidoc2dial 100 \
+      --model-manifest cache/model-manifest.json \
+      --execution-mode throughput --query-concurrency "$query_concurrency" \
+      --run-tag "${sweep_tag}-q${query_concurrency}"
+  done
+)
+```
+
+Повторите перспективные настройки, проверьте quality-метрики и сравните QPS с p95 latency.
+Большая занятая VRAM сама по себе не означает высокую загрузку вычислительных блоков GPU.
+Настройки scheduler и клиентских batches описаны в [vLLM](vllm.md#параллельные-запросы-и-batching).
 
 Повтор полного прогона на одном датасете (новый tag создастся автоматически):
 

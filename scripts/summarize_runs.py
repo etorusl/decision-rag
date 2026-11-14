@@ -100,6 +100,8 @@ def flatten_summary(path):
     latency, work = data["latency"], data.get("work", {})
     count = latency.get("queries", 0)
     config = data.get("config", {})
+    execution = data.get('execution', {})
+    throughput = data.get('throughput', {})
     search = config.get('runtime', {}).get('search_runtime', {})
     legacy_search = config.get('runtime', {}).get('search', '')
     env = data.get("environment", {})
@@ -108,6 +110,12 @@ def flatten_summary(path):
     row = {
         "run": str(path.parent),
         **model_identity(config),
+        "execution_mode": execution.get('mode', 'latency'),
+        "query_concurrency": execution.get('query_concurrency', 1),
+        "effective_query_concurrency": execution.get('effective_query_concurrency', 1),
+        "observed_query_concurrency": execution.get('observed_query_concurrency'),
+        "throughput.queries_per_second": throughput.get('queries_per_second'),
+        "throughput.wall_seconds": throughput.get('wall_seconds'),
         "queries": count,
         "labeled_queries": data.get("labeled_queries", 0),
         "unlabeled_queries": data.get("unlabeled_queries", 0),
@@ -138,6 +146,7 @@ def flatten_summary(path):
         row[f"gpu_peak_{kind}_gib"] = value / 2**30 if value is not None else None
     telemetry = data.get("gpu_telemetry", {})
     row["gpu_device_peak_used_gib"] = telemetry.get("peak_device_used_bytes", 0) / 2**30 if telemetry.get("samples") else None
+    row['gpu_mean_utilization_percent'] = telemetry.get('mean_utilization_percent')
     row["inference_process"] = data.get("inference_process", "benchmark_process")
     return row
 
@@ -145,7 +154,7 @@ def flatten_summary(path):
 def csv_text(rows):
     if not rows:
         raise ValueError("No summary rows")
-    leading = ["run", "run_type", "model", "embedding_model", "reranker_model",
+    leading = ["run", "run_type", "model", "embedding_model", "reranker_model", "execution_mode", "query_concurrency",
                "queries", "labeled_queries", "unlabeled_queries"]
     fields = leading + sorted(set().union(*(row.keys() for row in rows)) - set(leading))
     stream = io.StringIO(newline="")
@@ -185,6 +194,7 @@ def markdown_text(rows):
             **row,
             "report_id": f'R{index}',
             "run_label": (f"R{index}: {row.get('run_label', 'unknown — model unknown')} "
+                          f"({row.get('execution_mode', 'latency')}, C={row.get('query_concurrency', 1)}) "
                           f"[{'/'.join(Path(row['run']).parts[-2:])}]"),
             "query_short": row.get("query_sha256", "")[:12],
             "corpus_short": row.get("corpus_sha256", "")[:12],
@@ -196,6 +206,9 @@ def markdown_text(rows):
         "",
         "Quality values are percentages; latency is seconds and memory is GiB. Missing values are shown as —.",
         "Compare matched query/corpus hashes, label protocols, hardware, and timing scopes. These rows are not pooled averages.",
+        ("Latency runs measure one query at a time. Throughput runs use closed-loop concurrent conversations; "
+        "their latency includes resource contention and server queues, but excludes waiting for a conversation worker. "
+        "Wall queries/s is completed queries divided by measured wall time; it is not the reciprocal of mean latency."),
         "",
         "## Quality",
         "",
@@ -211,10 +224,14 @@ def markdown_text(rows):
                 ("latency.p95_seconds", "p95 s"),
                 ("latency.p99_seconds", "p99 s"),
                 ("latency.serial_queries_per_second", "Serial queries/s"),
+                ("throughput.queries_per_second", "Wall queries/s"),
+                ("throughput.wall_seconds", "Measured wall s"),
+                ("observed_query_concurrency", "Peak active queries"),
                 ("mean_query_embedding_ms", "Query embedding ms"),
                 ("mean_vector_search_ms", "Vector search ms"),
                 ("search_index_gib", "Index GiB"),
                 ("gpu_device_peak_used_gib", "Device peak GiB"),
+                ("gpu_mean_utilization_percent", "Mean GPU util %"),
                 ("gpu_peak_allocated_gib", "GPU allocated GiB"),
                 ("gpu_peak_reserved_gib", "GPU reserved GiB"),
                 ("work.input_tokens_per_query", "Input tokens/query"),
@@ -235,6 +252,7 @@ def markdown_text(rows):
                 ("warmup_queries", "Warmups"),
                 ("gpu", "GPU"),
                 ("engine", "Inference engine"),
+                ("effective_query_concurrency", "Workers"),
                 ("search_device", "Search device"),
                 ("search_precision", "Search precision"),
                 ("git_dirty", "Dirty tree"),

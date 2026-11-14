@@ -1,4 +1,6 @@
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
 import httpx
@@ -308,6 +310,81 @@ def test_bge_dense_rerank_pipeline_dispatches_raw_pairs_and_labels_both_models()
     assert result.latency_seconds >= sum(row["seconds"] for row in result.stages)
     assert retriever.runtime_metadata["embedding"]["model"] == BGE_EMBED_MODEL
     assert retriever.runtime_metadata["reranker"]["model"] == BGE_RERANK_MODEL
+
+
+@pytest.mark.parametrize('rerank', [False, True])
+def test_concurrent_queries_overlap_http_and_share_one_search_index(monkeypatch, rerank):
+    from decision_rag.dense_search import ExactDenseIndex
+
+    embedding_barrier, reranker_barrier = threading.Barrier(2), threading.Barrier(2)
+    state_lock = threading.Lock()
+    created, searched, embedding_inputs, reranker_queries = [], [], [], []
+
+    def index_factory(*args, **kwargs):
+        index = ExactDenseIndex(*args, **kwargs)
+        created.append(index)
+        search = index.search
+        def tracked_search(*args, **kwargs):
+            with state_lock:
+                searched.append(id(index))
+            return search(*args, **kwargs)
+        index.search = tracked_search
+        return index
+
+    monkeypatch.setattr('decision_rag.vllm_retrieval.ExactDenseIndex', index_factory)
+    vectors = {'apple': [1, 0], 'pear': [1, 1], 'banana': [0, 1],
+               'apple-query': [1, 0], 'banana-query': [0, 1]}
+
+    def embeddings(request):
+        body = json.loads(request.content)
+        with state_lock:
+            embedding_inputs.append(body['input'])
+        if body['input'] in [['apple-query'], ['banana-query']]:
+            # A serialized retrieve() or HTTP lock would time out here.
+            embedding_barrier.wait(timeout=5)
+        rows = [{'index': i, 'embedding': vectors[text]} for i, text in enumerate(body['input'])]
+        return httpx.Response(200, json={'model': BGE_EMBED_MODEL, 'data': rows[::-1],
+                                        'usage': {'prompt_tokens': 3 * len(rows)}})
+
+    def scores(request):
+        body = json.loads(request.content)
+        query = body['text_1']
+        with state_lock:
+            reranker_queries.append(query)
+        reranker_barrier.wait(timeout=5)
+        values = ({'apple': .3, 'pear': .9, 'banana': .1} if query == 'apple-query'
+                  else {'apple': .8, 'pear': .1, 'banana': .7})
+        rows = [{'index': i, 'score': values[text]} for i, text in enumerate(body['text_2'])]
+        return httpx.Response(200, json={'model': BGE_RERANK_MODEL, 'data': rows[::-1],
+                                        'usage': {'prompt_tokens': 7 * len(rows)}})
+
+    with pooling_client(BGE_EMBED_MODEL, embeddings) as embedding_client, \
+            pooling_client(BGE_RERANK_MODEL, scores) as reranker_client:
+        if rerank:
+            retriever = VLLMDenseRerankRetriever(corpus(), BGE_EMBED_MODEL, BGE_RERANK_MODEL,
+                                                search_device='cpu', candidates=3, top_k=2,
+                                                embedding_client=embedding_client, reranker_client=reranker_client)
+        else:
+            retriever = VLLMDenseRetriever(corpus(), BGE_EMBED_MODEL, search_device='cpu', top_k=2,
+                                          client=embedding_client)
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(retriever.retrieve, [Query('a', 'apple-query'), Query('b', 'banana-query')]))
+            assert len(created) == 1
+            assert searched == [id(created[0]), id(created[0])]
+            assert embedding_inputs[0] == ['apple', 'pear', 'banana']
+            assert sorted(embedding_inputs[1:]) == [['apple-query'], ['banana-query']]
+            assert [result.query_id for result in results] == ['a', 'b']
+            assert [result.ids for result in results] == (
+                [['p2', 'p1'], ['p1', 'p3']] if rerank else [['p1', 'p2'], ['p3', 'p2']])
+            for result in results:
+                assert result.stages[0]['input_tokens'] == 3
+                assert result.stages[0]['requests'] == 1
+                if rerank:
+                    assert result.stages[1]['input_tokens'] == 21
+            assert sorted(reranker_queries) == (['apple-query', 'banana-query'] if rerank else [])
+        finally:
+            retriever.close()
 
 
 @pytest.mark.parametrize("model", [RERANK_MODEL, BGE_RERANK_MODEL])

@@ -219,9 +219,11 @@ def fake_run(monkeypatch, tmp_path):
             events.append(("enter",))
             return self
 
-        def start(self, model, revision, port, kind, memory, max_len):
+        def start(self, model, revision, port, kind, memory, max_len, **kwargs):
             self.kinds.append(kind)
             events.append(("start", kind))
+            events.append(('server_command', runner.server_command(
+                'vllm', model, revision, port, kind, memory, max_len, **kwargs)))
             return f"http://127.0.0.1:{port}"
 
         def __exit__(self, *args):
@@ -239,6 +241,13 @@ def test_default_pipeline_uses_ready_vllm_models_and_releases_pooling_before_lm(
         "naive-binary-vllm", "naive-choice-vllm"]
     assert all(option(call, "--limit") == "3" for call in benchmarks)
     assert all(option(call, '--gpu-monitor-index') == '1' for call in benchmarks)
+    assert all(option(call, '--execution-mode') == 'throughput' for call in benchmarks)
+    assert all(option(call, '--query-concurrency') == '8' for call in benchmarks)
+    assert all(option(call, '--vllm-batch-size') == '64' for call in benchmarks)
+    assert all(option(call, '--batch-size') == '16' for call in benchmarks)
+    commands = [event[1] for event in events if event[0] == 'server_command']
+    assert [option(command, '--max-num-seqs') for command in commands] == ['64'] * 4 + ['128']
+    assert [option(command, '--max-num-batched-tokens') for command in commands] == ['16384'] * 4 + ['32768']
     assert set(masks) == {'1'}
     assert [event for event in events if event[0] == 'server_gpu'] == [('server_gpu', '1')] * 3
     for call in benchmarks[1:5]:
@@ -261,6 +270,63 @@ def test_default_pipeline_uses_ready_vllm_models_and_releases_pooling_before_lm(
     assert server_logs[1] == str(Path(server_logs[0]) / 'bge')
     assert [event[0] for event in events if event[0] in ('enter', 'close')] == ['enter', 'close'] * 3
     assert not any("training" in str(call) or "--backend hf" in str(call) for call in calls)
+
+
+def test_explicit_latency_profile_preserves_original_scheduler_limits(fake_run):
+    calls, events, _ = fake_run
+    runner.main(['scifact', '3', '--run-tag', 'latency', '--execution-mode', 'latency'])
+    benchmarks = [call for call in calls if 'benchmark' in call]
+    assert len(benchmarks) == 7
+    assert all(option(call, '--execution-mode') == 'latency' for call in benchmarks)
+    assert all(option(call, '--query-concurrency') == '1' for call in benchmarks)
+    commands = [event[1] for event in events if event[0] == 'server_command']
+    assert [option(command, '--max-num-seqs') for command in commands] == ['16'] * 4 + ['64']
+    assert [option(command, '--max-num-batched-tokens') for command in commands] == ['16384'] * 4 + ['32768']
+    assert [option(command, '--gpu-memory-utilization') for command in commands] == ['0.4'] * 4 + ['0.85']
+
+
+def test_throughput_tuning_controls_reach_all_clients_and_servers(fake_run, tmp_path):
+    calls, events, _ = fake_run
+    runner.main(['scifact', '3', '--run-tag', 'tuned', '--query-concurrency', '4',
+                 '--decision-max-num-seqs', '256', '--pool-max-num-seqs', '128',
+                 '--decision-max-num-batched-tokens', '8192', '--pool-max-num-batched-tokens', '32768',
+                 '--vllm-batch-size', '32', '--batch-size', '64'])
+    benchmarks = [call for call in calls if 'benchmark' in call]
+    assert all(option(call, '--query-concurrency') == '4' for call in benchmarks)
+    assert all(option(call, '--vllm-batch-size') == '32' for call in benchmarks)
+    assert all(option(call, '--batch-size') == '64' for call in benchmarks)
+    assert all('--concurrency' not in call for call in benchmarks)  # no nested decision HTTP/chunk concurrency
+    commands = [event[1] for event in events if event[0] == 'server_command']
+    assert [option(command, '--max-num-seqs') for command in commands] == ['128'] * 4 + ['256']
+    assert [option(command, '--max-num-batched-tokens') for command in commands] == ['32768'] * 4 + ['8192']
+    config = json.loads((tmp_path / 'results/tuned/scifact/server-config.json').read_text())
+    assert config['execution_mode'] == 'throughput'
+    assert config['query_concurrency'] == 4
+    assert config['pool_max_num_seqs'] == 128
+
+
+def test_automatic_pool_token_budget_tracks_each_model_context(fake_run):
+    _, events, _ = fake_run
+    runner.main(['scifact', '3', '--run-tag', 'contexts', '--pool-max-model-len', '32768'])
+    commands = [event[1] for event in events if event[0] == 'server_command']
+    assert [option(command, '--max-num-batched-tokens') for command in commands[:4]] == [
+        '32768', '32768', '16384', '16384']
+
+
+@pytest.mark.parametrize('options', [
+    ['--execution-mode', 'latency', '--query-concurrency', '2'],
+    ['--query-concurrency', '0'], ['--decision-max-num-seqs', '0'], ['--pool-max-num-seqs', '-1'],
+    ['--decision-max-num-batched-tokens', '0'], ['--pool-max-num-batched-tokens', '-1'],
+    ['--vllm-batch-size', '0'], ['--batch-size', '-1'],
+    ['--decision-max-num-seqs', '256', '--decision-max-num-batched-tokens', '128'],
+    ['--pool-max-num-seqs', '32768'], ['--pool-max-num-batched-tokens', '4096'],
+])
+def test_invalid_throughput_settings_fail_before_launch(fake_run, options):
+    calls, events, _ = fake_run
+    with pytest.raises(SystemExit):
+        runner.main(['scifact', '3', '--run-tag', 'invalid', *options])
+    assert not calls
+    assert not events
 
 
 def test_original_matrix_remains_available_unchanged(fake_run):

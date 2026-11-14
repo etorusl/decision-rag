@@ -26,14 +26,19 @@ RERANK_OVERRIDES = {
 }
 
 
-def server_command(executable, model, revision, port, kind, memory, max_model_len):
+def server_command(executable, model, revision, port, kind, memory, max_model_len, *,
+                   max_num_seqs=None, max_num_batched_tokens=None):
+    if max_num_seqs is None:
+        max_num_seqs = 64 if kind == 'decision' else 16
+    if max_num_batched_tokens is None:
+        max_num_batched_tokens = max(16384, max_model_len)
     command = [str(executable), 'serve', model, '--host', '127.0.0.1', '--port', str(port),
                '--served-model-name', model, '--revision', revision, '--tokenizer-revision', revision,
                '--dtype', 'bfloat16', '--tensor-parallel-size', '1',
                '--gpu-memory-utilization', str(memory), '--max-model-len', str(max_model_len),
                '--runner', 'generate' if kind == 'decision' else 'pooling',
-               '--max-num-seqs', '64' if kind == 'decision' else '16',
-               '--max-num-batched-tokens', str(max(16384, max_model_len)),
+               '--max-num-seqs', str(max_num_seqs),
+               '--max-num-batched-tokens', str(max_num_batched_tokens),
                '--generation-config', 'vllm', '--enable-prompt-tokens-details']
     if kind == 'decision':
         command += ['--logprobs-mode', 'processed_logprobs', '--max-logprobs', '26', '--enable-prefix-caching']
@@ -66,11 +71,13 @@ class Servers:
         self.model_env = model_env or {}
         self.processes = []
 
-    def start(self, model, revision, port, kind, memory, max_model_len):
+    def start(self, model, revision, port, kind, memory, max_model_len, *,
+              max_num_seqs=None, max_num_batched_tokens=None):
         with socket.socket() as probe:
             if probe.connect_ex(('127.0.0.1', port)) == 0:
                 raise RuntimeError(f'Port {port} is occupied. Stop that server or choose another --port-base.')
-        command = server_command(self.executable, model, revision, port, kind, memory, max_model_len)
+        command = server_command(self.executable, model, revision, port, kind, memory, max_model_len,
+                                 max_num_seqs=max_num_seqs, max_num_batched_tokens=max_num_batched_tokens)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         (self.log_dir / f'{kind}-command.json').write_text(json.dumps(command, indent=2) + '\n')
         log = (self.log_dir / f'{kind}.log').open('w')
@@ -154,6 +161,22 @@ def main(argv=None):
     parser.add_argument('--bge-reranker-model', default='BAAI/bge-reranker-v2-m3')
     parser.add_argument('--skip-bge', action='store_true', help='Run the original five-method matrix only')
     parser.add_argument('--model-manifest', help='Manifest from download_models.py; use pinned cached models offline')
+    parser.add_argument('--execution-mode', choices=['latency', 'throughput'], default='throughput',
+                        help='Throughput runs concurrent queries; latency runs one query at a time')
+    parser.add_argument('--query-concurrency', type=int,
+                        help='Maximum active retrieval queries (default: throughput 8, latency 1)')
+    parser.add_argument('--decision-max-num-seqs', type=int,
+                        help='vLLM decision sequence cap (default: throughput 128, latency 64)')
+    parser.add_argument('--pool-max-num-seqs', type=int,
+                        help='Per-server pooling sequence cap (default: throughput 64, latency 16)')
+    parser.add_argument('--decision-max-num-batched-tokens', type=int,
+                        help='Decision scheduler token budget (default: max(16384, model context))')
+    parser.add_argument('--pool-max-num-batched-tokens', type=int,
+                        help='Pooling scheduler token budget (default: max(16384, each server context))')
+    parser.add_argument('--vllm-batch-size', type=int, default=64,
+                        help='Decision sequences per HTTP request; independent of query concurrency')
+    parser.add_argument('--batch-size', type=int, default=16,
+                        help='Embedding/reranker inputs per HTTP request')
     parser.add_argument('--port-base', type=int, default=8000)
     parser.add_argument('--max-model-len', type=int, default=32768)
     parser.add_argument('--pool-max-model-len', type=int, default=8192)
@@ -168,6 +191,35 @@ def main(argv=None):
     parser.add_argument('--startup-timeout', type=float, default=1200)
     add_logging_args(parser)
     args = parser.parse_args(argv)
+    throughput = args.execution_mode == 'throughput'
+    if args.query_concurrency is None:
+        args.query_concurrency = 8 if throughput else 1
+    if args.decision_max_num_seqs is None:
+        args.decision_max_num_seqs = 128 if throughput else 64
+    if args.pool_max_num_seqs is None:
+        args.pool_max_num_seqs = 64 if throughput else 16
+    if args.decision_max_num_batched_tokens is None:
+        args.decision_max_num_batched_tokens = max(16384, args.max_model_len)
+    for name in ('query_concurrency', 'decision_max_num_seqs', 'pool_max_num_seqs',
+                 'decision_max_num_batched_tokens', 'pool_max_num_batched_tokens',
+                 'vllm_batch_size', 'batch_size', 'pool_max_model_len'):
+        value = getattr(args, name)
+        if value is not None and value < 1:
+            parser.error(f'--{name.replace("_", "-")} must be positive')
+    if not throughput and args.query_concurrency != 1:
+        parser.error('--execution-mode latency requires --query-concurrency 1')
+    if args.max_model_len <= 256:
+        parser.error('--max-model-len must exceed the 256-token request safety margin')
+    if args.decision_max_num_batched_tokens < args.decision_max_num_seqs:
+        parser.error('--decision-max-num-batched-tokens must be >= --decision-max-num-seqs')
+    pool_lengths = [] if args.ablations else [args.pool_max_model_len]
+    if not args.ablations and not args.skip_bge:
+        pool_lengths.append(args.bge_max_model_len)
+        if args.pool_max_num_batched_tokens is not None and args.pool_max_num_batched_tokens < args.bge_max_model_len:
+            parser.error('--pool-max-num-batched-tokens must be >= --bge-max-model-len (BGE has no chunked prefill)')
+    if any((args.pool_max_num_batched_tokens or max(16384, length)) < args.pool_max_num_seqs
+           for length in pool_lengths):
+        parser.error('Pooling scheduler token budget must be >= --pool-max-num-seqs')
     if not args.gpu_index.isascii() or not args.gpu_index.isdecimal():
         parser.error('--gpu-index must be one nonnegative GPU index')
     if args.limit != 'all' and int(args.limit) < 1:
@@ -192,6 +244,7 @@ def main(argv=None):
         reporter.event('suite_started', f'Benchmark suite: {args.dataset}; logs: {run_dir}',
                        dataset=args.dataset, limit=args.limit, gpu_index=args.gpu_index,
                        search_device=args.search_device,
+                       execution_mode=args.execution_mode, query_concurrency=args.query_concurrency,
                        benchmarks=benchmark_count(args), output=str(run_dir))
         run_suite(args, executable, run_dir, reporter)
     print(f'Results: {run_dir}')
@@ -255,6 +308,8 @@ def run_suite(args, executable, run_dir, reporter):
         run(*cli, 'prepare', args.dataset, '--output', f'data/{args.dataset}')
     common = ['--corpus', f'data/{args.dataset}/corpus.jsonl', '--queries', f'data/{args.dataset}/queries.jsonl',
               '--top-k', '20', '--warmup', '2', '--gpu-monitor-index', args.gpu_index,
+              '--execution-mode', args.execution_mode, '--query-concurrency', str(args.query_concurrency),
+              '--vllm-batch-size', str(args.vllm_batch_size), '--batch-size', str(args.batch_size),
               '--progress', args.progress, '--log-interval', str(args.log_interval)]
     if args.limit != 'all':
         common += ['--limit', args.limit]
@@ -276,14 +331,18 @@ def run_suite(args, executable, run_dir, reporter):
         with Servers(log_directory, executable, args.startup_timeout, args.gpu_index, reporter,
                      model_env=model_env) as servers:
             embedding_url = servers.start(embedding_model, revisions[embedding_model], args.port_base + 1,
-                                          'embedding', args.pool_memory, max_model_len)
+                                          'embedding', args.pool_memory, max_model_len,
+                                          max_num_seqs=args.pool_max_num_seqs,
+                                          max_num_batched_tokens=args.pool_max_num_batched_tokens)
             dense = ['--engine', 'vllm', '--model', embedding_model, '--embedding-url', embedding_url,
                      '--search-device', args.search_device,
                      '--embedding-revision', revisions[embedding_model], '--index-dir',
                      f'cache/vllm-dense/{args.dataset}/{embedding_model.replace("/", "_")}-{revisions[embedding_model]}']
             benchmark(f'dense{suffix}-vllm', ['--method', 'dense', *dense])
             reranker_url = servers.start(reranker_model, revisions[reranker_model], args.port_base + 2,
-                                         'reranker', args.pool_memory, max_model_len)
+                                         'reranker', args.pool_memory, max_model_len,
+                                         max_num_seqs=args.pool_max_num_seqs,
+                                         max_num_batched_tokens=args.pool_max_num_batched_tokens)
             benchmark(f'dense-rerank{suffix}-vllm', ['--method', 'dense-rerank', *dense,
                       '--reranker-model', reranker_model, '--reranker-url', reranker_url,
                       '--reranker-revision', revisions[reranker_model]])
@@ -296,7 +355,9 @@ def run_suite(args, executable, run_dir, reporter):
     with Servers(run_dir / 'servers', executable, args.startup_timeout, args.gpu_index, reporter,
                  model_env=model_env) as servers:
         decision_url = servers.start(args.naive_model, revisions[args.naive_model], args.port_base,
-                                     'decision', args.decision_memory, args.max_model_len)
+                                     'decision', args.decision_memory, args.max_model_len,
+                                     max_num_seqs=args.decision_max_num_seqs,
+                                     max_num_batched_tokens=args.decision_max_num_batched_tokens)
         naive = ['--backend', 'vllm', '--model', args.naive_model, '--model-revision', revisions[args.naive_model],
                  '--base-url', decision_url, '--max-context-tokens', str(args.max_model_len),
                  '--max-request-tokens', str(min(30000, args.max_model_len - 256)),
