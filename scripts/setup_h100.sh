@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
+source scripts/gpu_env.sh
 python_bin="${DECISION_RAG_PYTHON:-python3.12}"
 if ! command -v "$python_bin" >/dev/null; then
   printf '%s\n' 'Python 3.12 is recommended. Set DECISION_RAG_PYTHON to a Python 3.11–3.13 executable.' >&2

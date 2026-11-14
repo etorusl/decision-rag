@@ -21,7 +21,7 @@ violations fail the run instead of silently changing the scoring method.
 Start the causal server with:
 
 ```bash
-vllm serve Qwen/Qwen3-8B \
+CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-8B \
   --host 127.0.0.1 --port 8000 \
   --dtype bfloat16 --max-model-len 32768 \
   --enable-prefix-caching --enable-prompt-tokens-details \

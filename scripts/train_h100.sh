@@ -2,6 +2,7 @@
 # Local supervised recipe, not the paper's unavailable general checkpoint.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+source scripts/gpu_env.sh
 source .venv/bin/activate
 dataset="${1:-multidoc2dial}"
 mode="${2:-smoke}"
@@ -24,7 +25,7 @@ fi
 decision-rag training-data "${record_args[@]}"
 python -m decision_rag.training "${train_args[@]}"
 decision-rag prepare "$dataset" --output "data/$dataset"
-eval_args=(--corpus "data/$dataset/corpus.jsonl" --queries "data/$dataset/queries.jsonl" --preset "$dataset" --backend head --checkpoint "$checkpoint" --choice-k 0 --warmup 2 --output "results/$run_tag/$dataset/trained-$mode")
+eval_args=(--corpus "data/$dataset/corpus.jsonl" --queries "data/$dataset/queries.jsonl" --preset "$dataset" --backend head --checkpoint "$checkpoint" --choice-k 0 --warmup 2 --gpu-monitor-index "$CUDA_VISIBLE_DEVICES" --output "results/$run_tag/$dataset/trained-$mode")
 if [[ "$mode" == smoke ]]; then eval_args+=(--limit 20); fi
 decision-rag benchmark "${eval_args[@]}"
 printf 'Checkpoint: %s\n' "$checkpoint"

@@ -41,9 +41,10 @@ def server_command(executable, model, revision, port, kind, memory, max_model_le
 
 
 class Servers:
-    def __init__(self, log_dir, executable, startup_timeout=1200):
+    def __init__(self, log_dir, executable, startup_timeout=1200, gpu_index='1'):
         self.log_dir, self.executable = Path(log_dir), executable
         self.startup_timeout = startup_timeout
+        self.gpu_index = gpu_index
         self.processes = []
 
     def start(self, model, revision, port, kind, memory, max_model_len):
@@ -54,7 +55,7 @@ class Servers:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         (self.log_dir / f'{kind}-command.json').write_text(json.dumps(command, indent=2) + '\n')
         log = (self.log_dir / f'{kind}.log').open('w')
-        env = {**os.environ, 'VLLM_USE_V1': '1'}
+        env = {**os.environ, 'VLLM_USE_V1': '1', 'CUDA_VISIBLE_DEVICES': self.gpu_index}
         try:
             process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env,
                                        start_new_session=True)
@@ -119,9 +120,12 @@ def main(argv=None):
     parser.add_argument('--pool-max-model-len', type=int, default=8192)
     parser.add_argument('--pool-memory', type=float, default=.40)
     parser.add_argument('--decision-memory', type=float, default=.85)
-    parser.add_argument('--gpu-index', default='0', help='Physical nvidia-smi index for monitoring')
+    parser.add_argument('--gpu-index', default=os.getenv('DECISION_RAG_GPU_INDEX') or '1',
+                        help='Single GPU index for CUDA_VISIBLE_DEVICES and nvidia-smi monitoring (default: 1)')
     parser.add_argument('--startup-timeout', type=float, default=1200)
     args = parser.parse_args(argv)
+    if not args.gpu_index.isascii() or not args.gpu_index.isdecimal():
+        parser.error('--gpu-index must be one nonnegative GPU index')
     if args.limit != 'all' and int(args.limit) < 1:
         parser.error('limit must be positive or all')
     if not 0 < args.pool_memory < .5 or not 0 < args.decision_memory < 1:
@@ -144,7 +148,8 @@ def main(argv=None):
     (run_dir / 'server-config.json').write_text(json.dumps({**vars(args), 'revisions': revisions}, indent=2) + '\n')
     cli = [sys.executable, '-m', 'decision_rag']
     def run(*command):
-        subprocess.run([str(x) for x in command], check=True)
+        subprocess.run([str(x) for x in command], check=True,
+                       env={**os.environ, 'CUDA_VISIBLE_DEVICES': args.gpu_index})
     run(*cli, 'prepare', args.dataset, '--output', f'data/{args.dataset}')
     common = ['--corpus', f'data/{args.dataset}/corpus.jsonl', '--queries', f'data/{args.dataset}/queries.jsonl',
               '--top-k', '20', '--warmup', '2', '--gpu-monitor-index', args.gpu_index]
@@ -154,7 +159,7 @@ def main(argv=None):
         run(*cli, 'benchmark', *common, *extra, '--output', run_dir / name)
     if not args.ablations:
         benchmark('bm25', ['--method', 'bm25'])
-        with Servers(run_dir / 'servers', executable, args.startup_timeout) as servers:
+        with Servers(run_dir / 'servers', executable, args.startup_timeout, args.gpu_index) as servers:
             embedding_url = servers.start(args.embedding_model, revisions[args.embedding_model], args.port_base + 1,
                                           'embedding', args.pool_memory, args.pool_max_model_len)
             dense = ['--engine', 'vllm', '--model', args.embedding_model, '--embedding-url', embedding_url,
@@ -166,7 +171,7 @@ def main(argv=None):
             benchmark('dense-rerank-vllm', ['--method', 'dense-rerank', *dense,
                       '--reranker-model', args.reranker_model, '--reranker-url', reranker_url,
                       '--reranker-revision', revisions[args.reranker_model]])
-    with Servers(run_dir / 'servers', executable, args.startup_timeout) as servers:
+    with Servers(run_dir / 'servers', executable, args.startup_timeout, args.gpu_index) as servers:
         decision_url = servers.start(args.naive_model, revisions[args.naive_model], args.port_base,
                                      'decision', args.decision_memory, args.max_model_len)
         naive = ['--backend', 'vllm', '--model', args.naive_model, '--model-revision', revisions[args.naive_model],

@@ -11,7 +11,7 @@ setup. Pin each model with its immutable Hugging Face commit using `--revision` 
 `--tokenizer-revision`; the benchmark must receive the same revision strings.
 
 ```bash
-vllm serve Qwen/Qwen3-Embedding-8B \
+CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-Embedding-8B \
   --host 127.0.0.1 --port 8001 --runner pooling \
   --dtype bfloat16 --max-model-len 8192 --gpu-memory-utilization 0.40 \
   --no-enable-prefix-caching \
@@ -21,7 +21,7 @@ vllm serve Qwen/Qwen3-Embedding-8B \
 In another process, on the same GPU:
 
 ```bash
-vllm serve Qwen/Qwen3-Reranker-8B \
+CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-Reranker-8B \
   --host 127.0.0.1 --port 8002 --runner pooling \
   --dtype bfloat16 --max-model-len 8192 --gpu-memory-utilization 0.40 \
   --no-enable-prefix-caching \

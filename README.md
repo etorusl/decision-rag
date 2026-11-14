@@ -21,6 +21,8 @@ Qwen3, Qwen3-Embedding и Qwen3-Reranker запускаются как localhost
 
 Нужны Linux, Python 3.12, H100 80 GB и NVIDIA driver с поддержкой CUDA 12.8.
 Модели и данные скачиваются на сервер; API-ключи не нужны.
+Скрипты vLLM и обучения по умолчанию используют физическую **GPU 1** через
+`CUDA_VISIBLE_DEVICES=1`; внутри процесса это `cuda:0`.
 
 ```bash
 git clone git@github.com:etorusl/decision-rag.git
@@ -39,6 +41,7 @@ bash scripts/benchmark_h100.sh conditionalqa all
 
 Сначала запускайте короткую выборку. Скрипт сам поднимает и останавливает локальные vLLM-серверы;
 для готовых моделей training-этапа нет. Установка vLLM изолирована в `.venv-vllm`.
+Для другой GPU задайте `DECISION_RAG_GPU_INDEX=N`; в benchmark runner также доступен `--gpu-index N`.
 H100 memory/latency и качество больших моделей **ещё не измерены** на машине разработки.
 Подробные команды, параметры и обработка OOM: [инструкция vLLM](docs/vllm.md).
 

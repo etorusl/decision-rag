@@ -85,19 +85,24 @@ def test_occupied_port_never_launches_or_kills_an_existing_server(monkeypatch, t
         servers.start("model", "a" * 40, 8000, "decision", .85, 32768)
 
 
-def test_failed_startup_cleans_owned_process_group(monkeypatch, tmp_path):
+@pytest.mark.parametrize('gpu_index', ['1', '2'])
+def test_failed_startup_cleans_owned_process_group(monkeypatch, tmp_path, gpu_index):
     process = Process(running=False)
     launches, killed = [], []
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '0,2')
     monkeypatch.setattr(runner.socket, "socket", lambda: Probe())
     def popen(command, **kwargs):
         launches.append((command, kwargs))
         return process
     monkeypatch.setattr(runner.subprocess, "Popen", popen)
     monkeypatch.setattr(runner.os, "killpg", lambda *args: killed.append(args))
-    with pytest.raises(RuntimeError, match="server exited"), runner.Servers(tmp_path, "vllm") as servers:
+    with pytest.raises(RuntimeError, match="server exited"), runner.Servers(
+        tmp_path, "vllm", gpu_index=gpu_index
+    ) as servers:
         servers.start("model", "a" * 40, 8000, "decision", .85, 32768)
     assert launches[0][1]["start_new_session"] is True
     assert launches[0][1]["env"]["VLLM_USE_V1"] == "1"
+    assert launches[0][1]["env"]["CUDA_VISIBLE_DEVICES"] == gpu_index
     assert launches[0][1]["stdout"].closed
     assert killed == [(process.pid, signal.SIGTERM)]
     assert servers.processes == []
@@ -136,6 +141,8 @@ def test_readiness_requires_requested_model(monkeypatch, tmp_path):
 
 @pytest.fixture
 def fake_run(monkeypatch, tmp_path):
+    monkeypatch.delenv('DECISION_RAG_GPU_INDEX', raising=False)
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '0,2')
     executable = tmp_path / "bin" / "python"
     executable.parent.mkdir()
     executable.with_name("vllm").touch()
@@ -144,11 +151,15 @@ def fake_run(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(
         HfApi=lambda: SimpleNamespace(model_info=lambda _: SimpleNamespace(sha="a" * 40))))
-    calls, events = [], []
-    monkeypatch.setattr(runner.subprocess, "run", lambda command, **kwargs: calls.append(command))
+    calls, events, masks = [], [], []
+    def run(command, **kwargs):
+        calls.append(command)
+        masks.append(kwargs['env']['CUDA_VISIBLE_DEVICES'])
+    monkeypatch.setattr(runner.subprocess, "run", run)
     class FakeServers:
         def __init__(self, *args):
             self.kinds = []
+            events.append(('server_gpu', args[3]))
 
         def __enter__(self):
             events.append(("enter",))
@@ -162,16 +173,19 @@ def fake_run(monkeypatch, tmp_path):
         def __exit__(self, *args):
             events.append(("close", *self.kinds))
     monkeypatch.setattr(runner, "Servers", FakeServers)
-    return calls, events
+    return calls, events, masks
 
 
 def test_default_pipeline_uses_ready_vllm_models_and_releases_pooling_before_lm(fake_run):
-    calls, events = fake_run
+    calls, events, masks = fake_run
     runner.main(["scifact", "3", "--run-tag", "test"])
     benchmarks = [call for call in calls if "benchmark" in call]
     assert [Path(option(call, "--output")).name for call in benchmarks] == [
         "bm25", "dense-vllm", "dense-rerank-vllm", "naive-binary-vllm", "naive-choice-vllm"]
     assert all(option(call, "--limit") == "3" for call in benchmarks)
+    assert all(option(call, '--gpu-monitor-index') == '1' for call in benchmarks)
+    assert set(masks) == {'1'}
+    assert [event for event in events if event[0] == 'server_gpu'] == [('server_gpu', '1')] * 2
     for call in benchmarks[1:3]:
         assert option(call, "--engine") == "vllm"
         assert option(call, "--embedding-revision") == "a" * 40
@@ -184,7 +198,7 @@ def test_default_pipeline_uses_ready_vllm_models_and_releases_pooling_before_lm(
 
 
 def test_ablations_run_only_inference_with_no_pooling_servers(fake_run):
-    calls, events = fake_run
+    calls, events, _ = fake_run
     runner.main(["multidoc2dial", "all", "--ablations", "--run-tag", "test"])
     benchmarks = [call for call in calls if "benchmark" in call]
     assert len(benchmarks) == 7
@@ -195,7 +209,7 @@ def test_ablations_run_only_inference_with_no_pooling_servers(fake_run):
 
 
 def test_benchmark_failure_still_exits_pooling_context(fake_run, monkeypatch):
-    _, events = fake_run
+    _, events, _ = fake_run
     def fail_dense(command, **kwargs):
         if "--method" in command and option(command, "--method") == "dense":
             raise subprocess.CalledProcessError(1, command)
@@ -204,3 +218,20 @@ def test_benchmark_failure_still_exits_pooling_context(fake_run, monkeypatch):
         runner.main(["scifact", "3", "--run-tag", "failure"])
     assert events[-1] == ("close", "embedding")
     assert ("start", "decision") not in events
+
+
+@pytest.mark.parametrize('cli_args,expected', [([], '2'), (['--gpu-index', '3'], '3')])
+def test_explicit_gpu_selection_routes_servers_clients_and_monitor_together(fake_run, monkeypatch, cli_args, expected):
+    calls, events, masks = fake_run
+    monkeypatch.setenv('DECISION_RAG_GPU_INDEX', '2')
+    runner.main(['scifact', '3', '--run-tag', 'override', *cli_args])
+    assert set(masks) == {expected}
+    assert [event for event in events if event[0] == 'server_gpu'] == [('server_gpu', expected)] * 2
+    assert all(option(call, '--gpu-monitor-index') == expected for call in calls if 'benchmark' in call)
+
+
+@pytest.mark.parametrize('gpu_index', ['0,1', '-1', 'all'])
+def test_gpu_selection_rejects_multiple_or_invalid_devices(gpu_index):
+    with pytest.raises(SystemExit) as exc:
+        runner.main(['--gpu-index', gpu_index])
+    assert exc.value.code == 2

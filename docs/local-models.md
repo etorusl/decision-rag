@@ -26,7 +26,7 @@ Training consumes JSONL with explicit zero-based class labels:
 Metadata is allowed and ignored by the trainer. Split by dialogue for conversational data and by page for ConditionalQA before constructing these requests; evaluation labels must never appear in training. The retrieval-stage preparation command in the main runbook builds requests from the training split. The trainer supports multi-class examples as well as binary retrieval questions, so public general decision tasks can also be supplied in the same schema.
 
 ```bash
-python -m decision_rag.training \
+CUDA_VISIBLE_DEVICES=1 python -m decision_rag.training \
   --train data/training/train.jsonl \
   --dev data/training/monitor.jsonl \
   --output checkpoints/md2d-lora \

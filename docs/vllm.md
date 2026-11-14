@@ -13,6 +13,11 @@ bash scripts/setup_vllm_h100.sh
 bash scripts/benchmark_h100.sh multidoc2dial 100
 ```
 
+По умолчанию скрипты используют физическую **GPU 1**: серверы vLLM получают
+`CUDA_VISIBLE_DEVICES=1`, а мониторинг опрашивает GPU 1. Внутри сервера выбранная карта
+видна как `cuda:0`. Общий параметр скриптов — `DECISION_RAG_GPU_INDEX` (по умолчанию `1`);
+для конкретного benchmark-запуска его можно явно переопределить через `--gpu-index N`.
+
 Нужны Linux, Python 3.12 и NVIDIA driver, совместимый с CUDA 12.8. Создаётся отдельное
 окружение `.venv-vllm`: vLLM 0.11.2 использует PyTorch 2.9.0, а training-окружение проекта
 фиксирует 2.7.1. Не устанавливайте `constraints-h100.txt` или `.[local]` в `.venv-vllm`.
@@ -60,7 +65,7 @@ bash scripts/ablate_h100.sh multidoc2dial 100
 
 ```bash
 source .venv-vllm/bin/activate
-vllm serve Qwen/Qwen3-8B \
+CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-8B \
   --host 127.0.0.1 --port 8000 --served-model-name Qwen/Qwen3-8B \
   --dtype bfloat16 --max-model-len 32768 --gpu-memory-utilization 0.85 \
   --generation-config vllm --enable-prefix-caching \
@@ -72,10 +77,10 @@ vllm serve Qwen/Qwen3-8B \
 ```bash
 source .venv-vllm/bin/activate
 decision-rag prepare multidoc2dial --output data/multidoc2dial
-decision-rag benchmark \
+CUDA_VISIBLE_DEVICES=1 decision-rag benchmark \
   --corpus data/multidoc2dial/corpus.jsonl --queries data/multidoc2dial/queries.jsonl \
   --preset multidoc2dial --backend vllm --model Qwen/Qwen3-8B \
-  --base-url http://127.0.0.1:8000 --limit 100 --gpu-monitor-index 0 \
+  --base-url http://127.0.0.1:8000 --limit 100 --gpu-monitor-index 1 \
   --output results/naive-vllm
 ```
 
@@ -109,7 +114,8 @@ vLLM (`--engine vllm`). Прежняя реализация доступна я�
 - **Память:** `nvidia-smi` опрашивается каждые 250 ms. Это sampled device memory целого GPU,
   включая все процессы и KV reservation. Не `torch.cuda.max_memory_allocated` клиентского процесса.
   Короткие пики между samples могут быть пропущены. `--gpu-monitor-index` задаёт физический
-  индекс; если используется `CUDA_VISIBLE_DEVICES=2`, укажите `--gpu-index 2` в runner.
+  индекс для уже запущенного сервера. В runner `--gpu-index` одновременно выбирает
+  физическую GPU для серверов через `CUDA_VISIBLE_DEVICES` и для мониторинга; default — `1`.
 
 Сохраняются timings, запросы, параметры, версии, hashes, server logs и model revisions.
 Сравнивайте одни и те же corpus/query SHA и precision. Для повторов задавайте разные `RUN_TAG`.
