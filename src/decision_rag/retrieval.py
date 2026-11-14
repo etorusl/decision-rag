@@ -7,7 +7,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 
-from .backends.base import DecisionBackend
+from .backends.base import DecisionBackend, sum_known
 from .prompts import build_prompt, label
 from .schema import Corpus, Query
 
@@ -91,6 +91,18 @@ class DecisionRetriever:
             ordered.append(node)
             stack.extend(reversed(corpus.children(node.id)))
         self._node_order = {n.id: i for i, n in enumerate(ordered)}
+
+    @property
+    def external_inference(self):
+        return getattr(self.backend, "external_inference", False)
+
+    def prepare_query(self, query):
+        if hasattr(self.backend, "prepare_query"):
+            self.backend.prepare_query(query)
+
+    def close(self):
+        if hasattr(self.backend, "close"):
+            self.backend.close()
 
     def reset(self):
         self.memory.clear()
@@ -183,8 +195,11 @@ class DecisionRetriever:
             results = [run(chunk) for chunk in chunks]
         scores = {node.id: p for chunk, out in results for node, p in zip(chunk, out.probabilities)}
         trace.append({"stage": stage, "candidate_ids": list(scores), "probabilities": list(scores.values()),
-                      "requests": len(chunks), "input_tokens": sum(o.input_tokens for _, o in results),
-                      "forward_passes": sum(o.forward_passes for _, o in results),
+                      "requests": sum_known(o.usage.get("requests", 1) for _, o in results),
+                      "input_tokens": sum_known(o.input_tokens for _, o in results),
+                      "forward_passes": sum_known(o.forward_passes for _, o in results),
+                      **{key: sum_known(o.usage.get(key, 0) for _, o in results)
+                         for key in {k for _, o in results for k in o.usage} if key != "requests"},
                       "seconds": time.perf_counter() - started})
         return scores
 
@@ -267,8 +282,9 @@ class DecisionRetriever:
             else:
                 ranked = reordered + ranked[len(shortlist):]
             trace.append({"stage": "choice", "candidate_ids": [n.id for n in shortlist],
-                          "probabilities": output.probabilities, "requests": 1,
+                          "probabilities": output.probabilities, "requests": output.usage.get("requests", 1),
                           "input_tokens": output.input_tokens, "forward_passes": output.forward_passes,
+                          **{k: v for k, v in output.usage.items() if k != "requests"},
                           "seconds": time.perf_counter() - began})
         if query.conversation_id and ranked and cfg.use_memory:
             page_id = corpus.page_id(ranked[0].id)

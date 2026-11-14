@@ -10,6 +10,7 @@ import sys
 import time
 from pathlib import Path
 
+from .backends.base import sum_known
 from .metrics import aggregate, latency_summary, retrieval_metrics
 
 
@@ -29,7 +30,7 @@ def environment():
             return None
     result = {"python": sys.version, "platform": platform.platform(), "git_commit": git('rev-parse', 'HEAD'),
               "git_dirty": bool(git('status', '--porcelain')), "packages": {}}
-    for name in ['decision-rag', 'numpy', 'torch', 'transformers', 'sentence-transformers', 'peft']:
+    for name in ['decision-rag', 'numpy', 'torch', 'transformers', 'sentence-transformers', 'peft', 'vllm']:
         try:
             result['packages'][name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
@@ -50,7 +51,7 @@ def file_hash(path):
     return digest.hexdigest()
 
 
-def evaluate(retriever, queries, output_dir, *, warmup=0, config=None, source_paths=(), dedup_text=False, initialization_seconds=None):
+def evaluate(retriever, queries, output_dir, *, warmup=0, config=None, source_paths=(), dedup_text=False, initialization_seconds=None, gpu_monitor_index=None):
     if warmup < 0:
         raise ValueError("warmup must be nonnegative")
     ids = [q.id for q in queries]
@@ -75,16 +76,24 @@ def evaluate(retriever, queries, output_dir, *, warmup=0, config=None, source_pa
             if query.turn_id <= previous:
                 raise ValueError(f"Non-increasing turns in conversation {query.conversation_id}")
             last[query.conversation_id] = query.turn_id
+    external = bool(getattr(retriever, "external_inference", False))
+    def sync():
+        if not external:
+            synchronize()
+    def prepare(query):
+        if hasattr(retriever, "prepare_query"):
+            retriever.prepare_query(query)
     retriever.reset()
-    synchronize()
+    sync()
     warmup_start = time.perf_counter()
     for query in queries[:warmup]:
+        prepare(query)
         retriever.retrieve(query)
-    synchronize()
+    sync()
     warmup_seconds = time.perf_counter() - warmup_start
     retriever.reset()  # warmup decisions must never leak into measured conversations
-    synchronize()
-    if 'torch' in sys.modules:
+    sync()
+    if not external and 'torch' in sys.modules:
         import torch
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
@@ -99,12 +108,15 @@ def evaluate(retriever, queries, output_dir, *, warmup=0, config=None, source_pa
             canonical[p.id] = hashlib.sha256(key.encode()).hexdigest()
     metrics, latencies = [], []
     work = {key: 0 for key in ("input_tokens", "forward_passes", "requests")}
-    with (output / 'queries.jsonl').open('w', encoding='utf-8') as stream:
+    from .telemetry import GPUMonitor
+    monitor = GPUMonitor(gpu_monitor_index)
+    with monitor, (output / 'queries.jsonl').open('w', encoding='utf-8') as stream:
         for query in queries:
-            synchronize()
+            prepare(query)
+            sync()
             start = time.perf_counter()
             result = retriever.retrieve(query)
-            synchronize()
+            sync()
             elapsed = time.perf_counter() - start
             relevant = query.relevant_ids
             ranking = result.ids
@@ -122,8 +134,11 @@ def evaluate(retriever, queries, output_dir, *, warmup=0, config=None, source_pa
             metrics.append(measured)
             latencies.append(elapsed)
             for stage in result.stages:
-                for key in work:
-                    work[key] += stage.get(key, 0)
+                for key in ("prompt_requests", "completion_tokens", "cached_tokens"):
+                    if key in stage:
+                        work.setdefault(key, 0)
+                for key, value in work.items():
+                    work[key] = sum_known([value, stage.get(key, 0)])
     summary = {"quality": aggregate(metrics), "labeled_queries": sum(bool(m) for m in metrics),
                "unlabeled_queries": sum(not bool(m) for m in metrics),
                "latency": latency_summary(latencies), "warmup_queries": min(warmup, len(queries)),
@@ -134,8 +149,10 @@ def evaluate(retriever, queries, output_dir, *, warmup=0, config=None, source_pa
                "dedup_normalization": ("whitespace+lowercase" if lowercase_dedup else "whitespace") if dedup_text else None,
                "environment": environment(), "config": config or {},
                "inputs": {str(p): file_hash(p) for p in source_paths},
-               "work": work}
-    if 'torch' in sys.modules:
+               "work": work,
+               "inference_process": "external_vllm_server" if external else "benchmark_process",
+               "gpu_telemetry": monitor.summary()}
+    if not external and 'torch' in sys.modules:
         import torch
         if torch.cuda.is_available():
             summary['gpu_peak_allocated_bytes'] = torch.cuda.max_memory_allocated()

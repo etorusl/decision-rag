@@ -57,12 +57,16 @@ def flatten_summary(path):
     }
     row.update({f"quality.{key}": value for key, value in data["quality"].items()})
     row.update({f"latency.{key}": value for key, value in latency.items() if key != "queries"})
-    for key in ("input_tokens", "forward_passes", "requests"):
+    for key in ("input_tokens", "forward_passes", "requests", "prompt_requests", "completion_tokens", "cached_tokens"):
         row[f"work.{key}"] = work.get(key, 0)
-        row[f"work.{key}_per_query"] = work.get(key, 0) / count if count else None
+        value = work.get(key, 0)
+        row[f"work.{key}_per_query"] = value / count if count and value is not None else None
     for kind in ("allocated", "reserved"):
         value = data.get(f"gpu_peak_{kind}_bytes")
         row[f"gpu_peak_{kind}_gib"] = value / 2**30 if value is not None else None
+    telemetry = data.get("gpu_telemetry", {})
+    row["gpu_device_peak_used_gib"] = telemetry.get("peak_device_used_bytes", 0) / 2**30 if telemetry.get("samples") else None
+    row["inference_process"] = data.get("inference_process", "benchmark_process")
     return row
 
 

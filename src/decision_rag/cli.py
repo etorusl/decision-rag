@@ -12,6 +12,13 @@ from .schema import Corpus, load_queries, read_jsonl
 
 
 def backend_from_args(args):
+    if args.backend == 'vllm':
+        from .backends.vllm import VLLMDecisionBackend
+        return VLLMDecisionBackend(
+            model_name=args.model or 'Qwen/Qwen3-8B', base_url=args.base_url,
+            tokenizer_revision=args.model_revision, max_context_tokens=args.max_context_tokens,
+            batch_size=args.vllm_batch_size, timeout=args.http_timeout,
+            cache_policy=args.prefix_cache_policy, prime_prefix=not args.no_prefix_prime)
     if args.backend == 'smoke':
         from .demo import SmokeBackend
         return SmokeBackend()
@@ -32,7 +39,7 @@ def backend_from_args(args):
 
 
 def model_args(p):
-    p.add_argument('--backend', choices=['hf','head','jev','smoke'], default='hf')
+    p.add_argument('--backend', choices=['vllm','hf','head','jev','smoke'], default='vllm')
     p.add_argument('--model')
     p.add_argument('--checkpoint')
     p.add_argument('--device', default='cuda')
@@ -72,6 +79,18 @@ def main(argv=None):
     bench.add_argument('--limit', type=int)
     bench.add_argument('--warmup', type=int, default=2)
     bench.add_argument('--dedup-text', action='store_true')
+    bench.add_argument('--engine', choices=['vllm','hf'], default='vllm', help='Dense/reranker inference engine')
+    bench.add_argument('--base-url', default='http://127.0.0.1:8000', help='Local vLLM decision server')
+    bench.add_argument('--embedding-url', default='http://127.0.0.1:8001')
+    bench.add_argument('--reranker-url', default='http://127.0.0.1:8002')
+    bench.add_argument('--model-revision', help='Pinned tokenizer revision matching served causal model')
+    bench.add_argument('--embedding-revision', help='Immutable embedding model revision for persistent index')
+    bench.add_argument('--reranker-revision')
+    bench.add_argument('--vllm-batch-size', type=int, default=64)
+    bench.add_argument('--http-timeout', type=float, default=120)
+    bench.add_argument('--prefix-cache-policy', choices=['per-query','warm'], default='per-query')
+    bench.add_argument('--no-prefix-prime', action='store_true')
+    bench.add_argument('--gpu-monitor-index', help='Physical nvidia-smi GPU index for device-level telemetry')
     bench.add_argument('--index-dir')
     bench.add_argument('--batch-size', type=int, default=16)
     bench.add_argument('--reranker-model', default='Qwen/Qwen3-Reranker-8B')
@@ -148,11 +167,28 @@ def main(argv=None):
             model = getattr(model, 'backbone', model)
             revision = getattr(getattr(model, 'config', None), '_commit_hash', None)
             config = {'method': args.method, 'backend': backend.name, 'retrieval': asdict(cfg),
-                      'model_revision': revision, 'args': vars(args)}
+                      'model_revision': revision, 'args': vars(args),
+                      'runtime': getattr(backend, 'runtime_metadata', {})}
         elif args.method == 'bm25':
             from .baselines import BM25Retriever
             retriever = BM25Retriever(corpus, args.top_k)
             config = vars(args)
+        elif args.engine == 'vllm':
+            from .vllm_retrieval import VLLMDenseRerankRetriever, VLLMDenseRetriever
+            if args.method == 'dense':
+                retriever = VLLMDenseRetriever(
+                    corpus, model_name=args.model or 'Qwen/Qwen3-Embedding-8B',
+                    base_url=args.embedding_url, top_k=args.top_k, batch_size=args.batch_size,
+                    index_dir=args.index_dir, revision=args.embedding_revision, timeout=args.http_timeout, dtype=args.dtype)
+            else:
+                retriever = VLLMDenseRerankRetriever(
+                    corpus, embedding_model=args.model or 'Qwen/Qwen3-Embedding-8B',
+                    reranker_model=args.reranker_model, embedding_base_url=args.embedding_url,
+                    reranker_base_url=args.reranker_url, top_k=args.top_k, candidates=args.rerank_candidates,
+                    batch_size=args.batch_size, index_dir=args.index_dir,
+                    embedding_revision=args.embedding_revision, reranker_revision=args.reranker_revision,
+                    timeout=args.http_timeout, dtype=args.dtype)
+            config = {**vars(args), 'runtime': retriever.runtime_metadata}
         elif args.method == 'dense-rerank':
             from .reranking import DenseRerankRetriever
             retriever = DenseRerankRetriever(
@@ -166,9 +202,14 @@ def main(argv=None):
             retriever = DenseRetriever(corpus, args.model or 'Qwen/Qwen3-Embedding-0.6B', args.top_k,
                                        args.device, args.batch_size, args.index_dir, dtype=args.dtype)
             config = vars(args)
-        result = evaluate(retriever, queries, args.output, warmup=args.warmup,
-                          config=config, source_paths=[args.corpus,args.queries], dedup_text=args.dedup_text,
-                          initialization_seconds=time.perf_counter() - initialization_start)
+        try:
+            result = evaluate(retriever, queries, args.output, warmup=args.warmup,
+                              config=config, source_paths=[args.corpus,args.queries], dedup_text=args.dedup_text,
+                              initialization_seconds=time.perf_counter() - initialization_start,
+                              gpu_monitor_index=args.gpu_monitor_index)
+        finally:
+            if hasattr(retriever, "close"):
+                retriever.close()
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
