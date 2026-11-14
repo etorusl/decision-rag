@@ -1,6 +1,7 @@
 """Backend contract: return probabilities in question/option order."""
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol, Sequence
+from typing import Protocol
 
 
 @dataclass

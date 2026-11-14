@@ -79,3 +79,8 @@ def test_md2d_own_memory_only_and_reset():
     assert 'center1' in b.contexts[3]
     retriever.reset()
     assert not retriever.memory
+
+
+def test_nq_requires_clustered_corpus():
+    with pytest.raises(ValueError, match="topic groups"):
+        DecisionRetriever(corpus(), Scripted([]), RetrievalConfig.for_dataset("nq"))

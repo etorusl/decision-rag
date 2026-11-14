@@ -24,7 +24,7 @@ conversation. Never tune budgets or model weights on the evaluation splits.
 
 | Benchmark | What it tests | Default evaluation | Corpus | Compatibility |
 |---|---|---|---|---|
-| MultiDoc2Dial | Help-center routing, dialogue history and notepad | validation, 4,201 turns | 413 pages / 4,110 passages | Passage IDs and structure segmentation match the published setup |
+| MultiDoc2Dial | Help-center routing, dialogue history and notepad | validation, 4,201 turns | 413 pages / 4,110 passages | Structure segmentation from the original MultiDoc2Dial benchmark |
 | ConditionalQA | Scenario understanding, several relevant paragraphs | dev, 285 questions, 271 paragraph-labeled | 652 pages / 58,483 units | Original evidence strings mapped to released element IDs |
 | SciFact / BEIR | Transfer to scientific claim evidence | test, 300 claims | 5,183 abstracts | Additional benchmark; not in the DecisionRAG paper |
 | MTRAG IBM Cloud | Longer technical dialogues and broad page screening | human, 205 turns, 188 labeled | 8,578 pages / 72,442 passages | Original gold labels; not the paper's expanded relevance pool |
@@ -38,7 +38,7 @@ then NQ after checking CPU RAM/disk capacity and building the hierarchy.
 ## MultiDoc2Dial
 
 Source: [official archive](https://doc2dial.github.io/multidoc2dial/file/multidoc2dial.zip)
-and [dataset description](https://huggingface.co/datasets/IBM/multidoc2dial).
+and [original IBM preprocessing specification](https://github.com/IBM/multidoc2dial/blob/main/scripts/data_preprocessor.py).
 
 The archive is extracted automatically. Pages merge document titles after removing
 the terminal `#<part>` suffix. Consecutive spans sharing a section ID **or** heading
@@ -63,11 +63,12 @@ The downloader pins that commit. IDs are `P<page-index>:e<element-index>`, retai
 the order in `documents.json`. A page description includes its title and `h1` part
 headings; each passage carries its page / `h1` / `h2` heading path in metadata.
 
-A subtle source detail matters: the paper describes `p`, `li`, and `tr` units,
-but its [released adapter](https://github.com/kilian-group/DecisionRAG/blob/87c14f6582914052763b56fade1f70a493268eb7/decisionrag/data/conditionalqa.py)
-retains **every element except `h1` and `h2`**, including 2,354 `h3` and two `h4`
-elements. This implementation follows that released behavior to recover the
-reported 58,483 units. Gold `h1`/`h2` evidence is excluded from paragraph qrels.
+The paper describes `p`, `li`, and `tr` units, but counting those elements in the
+original `documents.json` yields 56,127 units. Including its 2,354 `h3` and two
+`h4` elements yields the reported 58,483. This implementation retains all elements
+except `h1` and `h2` as an explicit reconstruction choice supported by those
+counts, not a confirmed specification from the DecisionRAG authors. Gold `h1`/`h2`
+evidence is excluded from paragraph qrels.
 Duplicate evidence strings within the same page map to all matching element IDs;
 normalization is used only as an exact-text fallback. Unresolved evidence raises
 an error instead of silently lowering recall.
@@ -103,7 +104,7 @@ human generation tasks, and Cloud relevance judgments.
 Only IBM Cloud tasks are selected. Source passage IDs and text remain unchanged;
 URL path segments define products. Short lines surrounded by blank lines provide
 section candidates for large-page pruning. This independent layout heuristic is
-not claimed to be byte-for-byte identical to the author's heuristic. Queries retain
+an implementation choice inferred from the paper’s layout description. Queries retain
 conversation IDs and turn indices and are sorted chronologically per conversation.
 Unlabeled turns remain in the query stream so they can update conversational memory.
 

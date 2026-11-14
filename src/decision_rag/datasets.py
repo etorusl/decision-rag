@@ -1,6 +1,8 @@
 """Deterministic adapters for public retrieval datasets, without remote Python execution.
 
 Source formats are documented in docs/datasets.md. Downloaded data are never committed.
+MD2D grouping/grounding specification: IBM/multidoc2dial, scripts/data_preprocessor.py.
+CQA h3/h4 inclusion is an explicit reconstruction from the original data and paper counts.
 """
 
 from __future__ import annotations
@@ -336,7 +338,7 @@ def conditionalqa(source: Path, split: str) -> tuple[Corpus, list[Query], list[P
         [doc_file, query_file],
         {
             "heading_evidence_excluded": heading_count,
-            "segmentation": "all released elements except h1/h2; h3/h4 retained to match author release",
+            "segmentation": "all original elements except h1/h2; h3/h4 retained as explicit count-matching reconstruction",
         },
     )
 
@@ -535,7 +537,7 @@ def mtrag(source: Path, split: str) -> tuple[Corpus, list[Query], list[Path], di
         [passages_file, docs_file, queries_file, qrels_file],
         {
             "relevance": "official gold only; paper's expanded GPT-5 pooled judgments are not included",
-            "headings": "deterministic layout heuristic; independently implemented, not identical to author's heuristic",
+            "headings": "deterministic layout heuristic inferred from paper; exact heading extraction unspecified",
         },
     )
 

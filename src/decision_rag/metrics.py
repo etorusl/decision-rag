@@ -9,18 +9,23 @@ import numpy as np
 
 
 def retrieval_metrics(ranking: Sequence[str], relevant: Mapping[str, float], ks=(1, 5, 10, 20)) -> dict:
+    if any(not math.isfinite(float(v)) for v in relevant.values()):
+        raise ValueError("Relevance grades must be finite")
     gold = {str(k): float(v) for k, v in relevant.items() if v > 0}
     if not gold:
         return {}
     ranking = list(dict.fromkeys(str(x) for x in ranking))
     scores = {}
+    highest = max(gold.values())
+    def gain(grade):
+        return 2 ** (grade - highest) - 2 ** (-highest)
     for k in ks:
         top = ranking[:k]
         hits = sum(x in gold for x in top)
         scores[f"recall@{k}"] = hits / len(gold)
         scores[f"hit@{k}"] = float(hits > 0)
-        dcg = sum((2 ** gold.get(x, 0) - 1) / math.log2(i + 2) for i, x in enumerate(top))
-        ideal = sum((2 ** v - 1) / math.log2(i + 2)
+        dcg = sum(gain(gold.get(x, 0)) / math.log2(i + 2) for i, x in enumerate(top))
+        ideal = sum(gain(v) / math.log2(i + 2)
                     for i, v in enumerate(sorted(gold.values(), reverse=True)[:k]))
         scores[f"ndcg@{k}"] = dcg / ideal
         scores[f"mrr@{k}"] = next((1 / (i + 1) for i, x in enumerate(top) if x in gold), 0.0)
@@ -45,11 +50,17 @@ def latency_summary(seconds: Sequence[float]) -> dict:
 def paired_bootstrap(a: Sequence[dict], b: Sequence[dict], metric="recall@10", samples=2000, seed=42):
     """Resample complete conversations (individual queries for non-dialogue data)."""
     left, right = {r['query_id']: r for r in a}, {r['query_id']: r for r in b}
+    if len(left) != len(a) or len(right) != len(b):
+        raise ValueError("Duplicate query IDs in paired runs")
+    if samples < 1:
+        raise ValueError("Bootstrap samples must be positive")
     if left.keys() != right.keys():
         raise ValueError("Paired runs must contain identical query IDs")
     groups = defaultdict(list)
     for qid, l in left.items():
         r = right[qid]
+        if l.get('conversation_id') != r.get('conversation_id'):
+            raise ValueError('Conversation IDs differ between paired runs')
         if metric in l['metrics'] and metric in r['metrics']:
             groups[l.get('conversation_id') or qid].append(l['metrics'][metric] - r['metrics'][metric])
     if not groups:

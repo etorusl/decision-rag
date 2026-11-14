@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -57,13 +58,13 @@ def main(argv=None):
     bench.add_argument('--corpus', required=True)
     bench.add_argument('--queries', required=True)
     bench.add_argument('--output', required=True)
-    bench.add_argument('--method', choices=['decision','bm25','dense'], default='decision')
+    bench.add_argument('--method', choices=['decision','bm25','dense','dense-rerank'], default='decision')
     bench.add_argument('--config', help='RetrievalConfig JSON file')
     bench.add_argument('--preset', choices=['generic','multidoc2dial','conditionalqa','mtrag','nq'], default='generic')
     bench.add_argument('--pages', type=int)
     bench.add_argument('--top-k', type=int, default=20)
     bench.add_argument('--choice-k', type=int, default=0)
-    bench.add_argument('--max-request-tokens', type=int, default=30000)
+    bench.add_argument('--max-request-tokens', type=int)
     bench.add_argument('--max-candidates', type=int, default=10000)
     bench.add_argument('--concurrency', type=int, default=1)
     bench.add_argument('--no-memory', action='store_true')
@@ -73,6 +74,9 @@ def main(argv=None):
     bench.add_argument('--dedup-text', action='store_true')
     bench.add_argument('--index-dir')
     bench.add_argument('--batch-size', type=int, default=16)
+    bench.add_argument('--reranker-model', default='Qwen/Qwen3-Reranker-8B')
+    bench.add_argument('--rerank-candidates', type=int, default=100)
+    bench.add_argument('--rerank-max-length', type=int, default=8192)
     model_args(bench)
     records = subs.add_parser('training-data', help='Generate local supervision from training-only queries')
     records.add_argument('--corpus', required=True)
@@ -117,6 +121,7 @@ def main(argv=None):
                                     monitor_fraction=.1 if args.dataset == 'conditionalqa' else .03)
     else:
         from .evaluation import evaluate
+        initialization_start = time.perf_counter()
         corpus = Corpus.load(args.corpus)
         queries = load_queries(args.queries)
         if args.limit is not None:
@@ -130,7 +135,7 @@ def main(argv=None):
                 cfg = RetrievalConfig(**json.loads(Path(args.config).read_text()))
             else:
                 changes = {'top_k': args.top_k, 'choice_k': args.choice_k,
-                               'max_request_tokens': args.max_request_tokens, 'max_candidates': args.max_candidates,
+                               'max_request_tokens': args.max_request_tokens or (20000 if args.preset == 'nq' else 30000), 'max_candidates': args.max_candidates,
                                'concurrency': args.concurrency, 'use_memory': not args.no_memory,
                                'shared_context': not args.independent}
                 if args.pages:
@@ -139,19 +144,31 @@ def main(argv=None):
                 cfg = RetrievalConfig.for_dataset(args.preset, **changes)
             backend = backend_from_args(args)
             retriever = DecisionRetriever(corpus, backend, cfg)
+            model = getattr(backend, 'model', None)
+            model = getattr(model, 'backbone', model)
+            revision = getattr(getattr(model, 'config', None), '_commit_hash', None)
             config = {'method': args.method, 'backend': backend.name, 'retrieval': asdict(cfg),
-                      'args': vars(args)}
+                      'model_revision': revision, 'args': vars(args)}
         elif args.method == 'bm25':
             from .baselines import BM25Retriever
             retriever = BM25Retriever(corpus, args.top_k)
             config = vars(args)
+        elif args.method == 'dense-rerank':
+            from .reranking import DenseRerankRetriever
+            retriever = DenseRerankRetriever(
+                corpus, embedding_model=args.model or 'Qwen/Qwen3-Embedding-8B',
+                reranker_model=args.reranker_model, top_k=args.top_k, candidates=args.rerank_candidates,
+                device=args.device, batch_size=args.batch_size, index_dir=args.index_dir,
+                dtype=args.dtype, max_length=args.rerank_max_length)
+            config = vars(args)
         else:
             from .baselines import DenseRetriever
             retriever = DenseRetriever(corpus, args.model or 'Qwen/Qwen3-Embedding-0.6B', args.top_k,
-                                       args.device, args.batch_size, args.index_dir)
+                                       args.device, args.batch_size, args.index_dir, dtype=args.dtype)
             config = vars(args)
         result = evaluate(retriever, queries, args.output, warmup=args.warmup,
-                          config=config, source_paths=[args.corpus,args.queries], dedup_text=args.dedup_text)
+                          config=config, source_paths=[args.corpus,args.queries], dedup_text=args.dedup_text,
+                          initialization_seconds=time.perf_counter() - initialization_start)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

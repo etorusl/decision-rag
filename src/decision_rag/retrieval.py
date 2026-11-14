@@ -77,10 +77,14 @@ class DecisionRetriever:
     def __init__(self, corpus: Corpus, backend: DecisionBackend, config: RetrievalConfig,
                  observer: Callable | None = None):
         self.corpus, self.backend, self.config = corpus, backend, config
+        if config.preset == "nq":
+            roots = corpus.children(corpus.root.id)
+            if not roots or any(n.kind != "group" or not corpus.descendants(n.id, "page") for n in roots):
+                raise ValueError("NQ requires topic groups above pages. Build the clustered corpus with "
+                                 "python -m decision_rag.hierarchy before retrieval.")
         self.memory: dict[str, list[str]] = {}
         self.observer = observer
         # Global reading order is independent of probabilities or query.
-        self._order = {n.id: i for i, n in enumerate(corpus.descendants(corpus.root.id, kind="passage"))}
         ordered, stack = [], [corpus.root]
         while stack:
             node = stack.pop()
@@ -97,9 +101,11 @@ class DecisionRetriever:
     def _rank(self, nodes, scores, k):
         return sorted(nodes, key=lambda n: (-scores[n.id], self._node_order[n.id]))[:k]
 
-    def _chunks(self, query, nodes, memory, title_only):
+    def _chunks(self, query, nodes, memory, title_only, candidate_limit=None):
         config = self.config
         size_limit = config.max_candidates if config.shared_context else 1
+        if candidate_limit is not None:
+            size_limit = min(size_limit, candidate_limit)
         chunks, chunk = [], []
         base, _ = build_prompt(query, [], self.corpus, memory, title_only)
         base_size = self.backend.count_tokens(base) + 128
@@ -159,7 +165,8 @@ class DecisionRetriever:
 
     def _score(self, query, nodes, stage, trace, memory=(), title_only=False):
         started = time.perf_counter()
-        chunks = self._chunks(query, nodes, memory, title_only)
+        chunks = self._chunks(query, nodes, memory, title_only,
+                              125 if self.config.preset == "nq" and stage == "clusters" else None)
         def run(chunk):
             context, questions = build_prompt(query, chunk, self.corpus, memory, title_only)
             if self.observer:

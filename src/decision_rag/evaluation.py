@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import platform
 import subprocess
 import sys
@@ -49,7 +50,7 @@ def file_hash(path):
     return digest.hexdigest()
 
 
-def evaluate(retriever, queries, output_dir, *, warmup=0, config=None, source_paths=(), dedup_text=False):
+def evaluate(retriever, queries, output_dir, *, warmup=0, config=None, source_paths=(), dedup_text=False, initialization_seconds=None):
     if warmup < 0:
         raise ValueError("warmup must be nonnegative")
     ids = [q.id for q in queries]
@@ -57,6 +58,8 @@ def evaluate(retriever, queries, output_dir, *, warmup=0, config=None, source_pa
         raise ValueError("Duplicate query IDs")
     passages = {p.id for p in retriever.corpus.passages}
     for query in queries:
+        if any(not math.isfinite(float(v)) for v in query.relevant_ids.values()):
+            raise ValueError("Relevance grades must be finite")
         unknown = set(query.relevant_ids) - passages
         if unknown:
             raise ValueError(f"Unknown gold passage IDs for {query.id}: {sorted(unknown)[:5]}")
@@ -73,8 +76,12 @@ def evaluate(retriever, queries, output_dir, *, warmup=0, config=None, source_pa
                 raise ValueError(f"Non-increasing turns in conversation {query.conversation_id}")
             last[query.conversation_id] = query.turn_id
     retriever.reset()
+    synchronize()
+    warmup_start = time.perf_counter()
     for query in queries[:warmup]:
         retriever.retrieve(query)
+    synchronize()
+    warmup_seconds = time.perf_counter() - warmup_start
     retriever.reset()  # warmup decisions must never leak into measured conversations
     synchronize()
     if 'torch' in sys.modules:
@@ -82,12 +89,16 @@ def evaluate(retriever, queries, output_dir, *, warmup=0, config=None, source_pa
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
     canonical = {}
+    lowercase_dedup = bool(queries) and all(q.metadata.get("dataset") == "mtrag" for q in queries)
     if dedup_text:
         import re
         for p in retriever.corpus.passages:
-            key = re.sub(r'\s+', ' ', p.text).strip().lower()
+            key = re.sub(r'\s+', ' ', p.text).strip()
+            if lowercase_dedup:
+                key = key.lower()
             canonical[p.id] = hashlib.sha256(key.encode()).hexdigest()
-    metrics, latencies, totals, records = [], [], [], []
+    metrics, latencies = [], []
+    work = {key: 0 for key in ("input_tokens", "forward_passes", "requests")}
     with (output / 'queries.jsonl').open('w', encoding='utf-8') as stream:
         for query in queries:
             synchronize()
@@ -108,18 +119,22 @@ def evaluate(retriever, queries, output_dir, *, warmup=0, config=None, source_pa
                       "labeled": bool(measured)}
             stream.write(json.dumps(record, ensure_ascii=False) + '\n')
             stream.flush()
-            records.append(record)
             metrics.append(measured)
             latencies.append(elapsed)
-            totals.extend(result.stages)
+            for stage in result.stages:
+                for key in work:
+                    work[key] += stage.get(key, 0)
     summary = {"quality": aggregate(metrics), "labeled_queries": sum(bool(m) for m in metrics),
                "unlabeled_queries": sum(not bool(m) for m in metrics),
                "latency": latency_summary(latencies), "warmup_queries": min(warmup, len(queries)),
+               "initialization_seconds": initialization_seconds,
+               "warmup_seconds": warmup_seconds,
                "timing_scope": "Complete serial retrieval after model/corpus/index initialization; no result cache",
-               "dedup_text": dedup_text, "environment": environment(), "config": config or {},
+               "dedup_text": dedup_text,
+               "dedup_normalization": ("whitespace+lowercase" if lowercase_dedup else "whitespace") if dedup_text else None,
+               "environment": environment(), "config": config or {},
                "inputs": {str(p): file_hash(p) for p in source_paths},
-               "work": {key: sum(row.get(key, 0) for row in totals)
-                        for key in ('input_tokens', 'forward_passes', 'requests')}}
+               "work": work}
     if 'torch' in sys.modules:
         import torch
         if torch.cuda.is_available():

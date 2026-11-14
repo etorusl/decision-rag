@@ -68,24 +68,13 @@ examples. It ranks by binary scores without the Jev choice step. A freshly initi
 a newly trained checkpoint cannot be labeled the authors' checkpoint. The publication does not
 fully specify the general mixture, sample seeds, prompt serialization or head dimensions.
 
-## Author code availability and limits
+## Implementation source
 
-On 2026-11-14, the public [kilian-group/DecisionRAG repository](https://github.com/kilian-group/DecisionRAG)
-contains loaders and walkers for MD2D, CQA and MTRAG; an OpenRouter Jev adapter; SQLite response
-caching; metrics; offline tests; and [`scripts/paper_runs.sh`](https://github.com/kilian-group/DecisionRAG/blob/main/scripts/paper_runs.sh).
-Its README was updated on November 13. Its recursive source tree does not contain NQ preparation
-or retrieval, local decision models, Appendix G training code/checkpoints, dense/reranker baseline
-runners, or the full downstream QA and expanded MTRAG relevance-labeling pipeline.
-
-The released scripts include variants and should not automatically be treated as an exact
-reproduction of every published row. In particular, their MC examples use 3 MD2D pages or 5 CQA
-pages, while the main paper configurations retain 10 and 3, respectively. The released `choose()`
-helper reuses the full binary context, whereas Appendix B.6 specifies shortlist-only context.
-The README also describes filling ranks below judged candidates from BM25; Algorithm 1 does not
-include that fallback. Preserve and report such differences when comparing implementations.
-
-No license file was present in the inspected author tree. This project uses the paper and public
-interfaces as references; the source is implemented independently rather than vendoring author code.
+The supplied PDF defines the retrieval algorithm and training architecture. This implementation
+is written independently from that description; third-party implementations are not treated as
+authoritative. Model and dataset interfaces are checked against their own official documentation.
+The supplied paper does not include the authors' trained checkpoint, exact cluster assignment
+artifacts or the sampled NQ evaluation IDs.
 
 ## API contract and token counting
 
@@ -93,9 +82,11 @@ interfaces as references; the source is implemented independently rather than ve
   The body contains `model`, shared `state`, and named `questions`. Binary questions use
   `type: noul` and `instructions`; read `answers[id].noul`. Choice questions additionally use
   a `criteria` map; read `answers[id].probabilities` in the original option order.
-- Direct TypeSafe model: `jev-1.13.0`. OpenRouter model: `typesafe/jev-1.13`; the author's
-  [configuration](https://github.com/kilian-group/DecisionRAG/blob/main/configs/judges.toml) pins
-  response snapshot `typesafe/jev-1.13-20260917`. A mismatch fails explicitly.
+- Direct TypeSafe model: `jev-1.13.0`. The optional OpenRouter adapter uses the documented
+  [`POST /api/alpha/decisions` endpoint](https://openrouter.ai/blog/tutorials/how-to-use-jev/),
+  model `typesafe/jev-1.13`, and response version `typesafe/jev-1.13-20260917` shown in the
+  provider's example. A mismatch fails explicitly; this is a provider version check, not an
+  assertion about the authors' deployed snapshot.
 - The [current TypeSafe limits](https://docs.typesafe.ai/models) distinguish 64k tokens per request
   from 32k per question, counting shared state plus that question. Long context requires an
   explicit TypeSafe header and raises both limits to 262k. Choice supports at most 255 options.

@@ -18,7 +18,7 @@ from .base import DecisionOutput
 
 
 class JevBackend:
-    """Jev 1.13 over TypeSafe directly or the paper's OpenRouter endpoint.
+    """Jev 1.13 over the providers' officially documented endpoints.
 
     ``count_tokens`` is a conservative UTF-8-byte bound because neither provider
     publishes Jev's tokenizer. Actual input usage comes from API responses.
@@ -26,7 +26,7 @@ class JevBackend:
 
     _PROVIDERS: ClassVar = {
         "typesafe": ("https://api.typesafe.ai/v1/systemone", "TYPESAFE_API_KEY", "jev-1.13.0"),
-        "openrouter": ("https://openrouter.ai/api/v1/systemone", "OPENROUTER_API_KEY", "typesafe/jev-1.13"),
+        "openrouter": ("https://openrouter.ai/api/alpha/decisions", "OPENROUTER_API_KEY", "typesafe/jev-1.13"),
     }
     _RETRYABLE: ClassVar = {429, 500, 502, 503, 504, 529}
     thread_safe = True  # httpx.Client supports sharing a connection pool across threads.

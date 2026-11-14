@@ -37,7 +37,7 @@ def test_choice_maps_options_and_restores_order():
 
 def test_openrouter_uses_pinned_snapshot():
     def handle(request):
-        assert str(request.url) == "https://openrouter.ai/api/v1/systemone"
+        assert str(request.url) == "https://openrouter.ai/api/alpha/decisions"
         return httpx.Response(200, json={"model": "typesafe/jev-1.14", "answers": {"q0": {"noul": .9}}})
     with pytest.raises(ValueError, match="model changed"):
         make_backend(handle, provider="openrouter").binary("state", ["Relevant?"])

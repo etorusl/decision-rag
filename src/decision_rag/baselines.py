@@ -32,6 +32,16 @@ class BM25Retriever:
         self.avgdl = float(self.lengths.mean()) if lengths else 1
         self.avgdl = self.avgdl or 1
 
+        norm = self.k1 * (1 - self.b + self.b * self.lengths / self.avgdl)
+        n = len(self.passages)
+        self.weights = {}
+        for token, rows in self.postings.items():
+            indices = np.array([i for i, _ in rows], dtype=np.int32)
+            frequencies = np.array([tf for _, tf in rows], dtype=np.float32)
+            idf = math.log(1 + (n - len(rows) + .5) / (len(rows) + .5))
+            self.weights[token] = (indices, idf * frequencies * (self.k1 + 1) / (frequencies + norm[indices]))
+        del self.postings
+
     def reset(self):
         pass
 
@@ -40,11 +50,10 @@ class BM25Retriever:
         n = len(self.passages)
         scores = np.zeros(n)
         for token in set(tokenize(query.context())):
-            postings = self.postings.get(token, [])
-            idf = math.log(1 + (n - len(postings) + .5) / (len(postings) + .5))
-            for idx, tf in postings:
-                scores[idx] += idf * tf * (self.k1 + 1) / (
-                    tf + self.k1 * (1 - self.b + self.b * self.lengths[idx] / self.avgdl))
+            posting = self.weights.get(token)
+            if posting is not None:
+                ids, weights = posting
+                scores[ids] += weights
         indices = np.argsort(-scores, kind="stable")[:self.top_k]
         return RetrievalResult(query.id, [self.passages[i].id for i in indices],
                                scores[indices].tolist(), time.perf_counter() - start, [])
@@ -52,7 +61,7 @@ class BM25Retriever:
 
 class DenseRetriever:
     def __init__(self, corpus, model_name="Qwen/Qwen3-Embedding-0.6B", top_k=20,
-                 device="cuda", batch_size=16, index_dir=None):
+                 device="cuda", batch_size=16, index_dir=None, dtype="bfloat16"):
         import hashlib
         import json
         from pathlib import Path
@@ -60,9 +69,23 @@ class DenseRetriever:
         from sentence_transformers import SentenceTransformer
         self.corpus, self.top_k, self.passages = corpus, top_k, corpus.passages
         self.model_name = model_name
-        self.model = SentenceTransformer(model_name, device=device, trust_remote_code=False)
-        self.fingerprint = hashlib.sha256(json.dumps([(p.id, p.text) for p in self.passages],
-                                                    ensure_ascii=False).encode()).hexdigest()
+        import torch
+
+        from .backends.decision_head import resolve_dtype
+        precision = resolve_dtype(dtype) if str(device).startswith("cuda") else torch.float32
+        self.model = SentenceTransformer(model_name, device=device, trust_remote_code=False,
+                                        model_kwargs={"torch_dtype": precision, "attn_implementation": "sdpa"})
+        self.dtype = str(precision)
+        self.revision = getattr(self.model[0].auto_model.config, "_commit_hash", None)
+        digest = hashlib.sha256()
+        for passage in self.passages:
+            for value in (passage.id, passage.text):
+                encoded = value.encode("utf-8")
+                digest.update(len(encoded).to_bytes(8, "big"))
+                digest.update(encoded)
+        self.fingerprint = digest.hexdigest()
+        expected_meta = {"model": model_name, "revision": self.revision, "dtype": self.dtype,
+                         "corpus": self.fingerprint}
         self.embeddings = None
         if index_dir:
             index_dir = Path(index_dir)
@@ -70,7 +93,7 @@ class DenseRetriever:
             meta = index_dir / 'meta.json'
             if meta.exists():
                 actual = json.loads(meta.read_text())
-                if actual != {"model": model_name, "corpus": self.fingerprint}:
+                if actual != expected_meta:
                     raise ValueError("Dense index model/corpus mismatch; use a new index directory")
                 self.embeddings = np.load(index_dir / 'embeddings.npy', mmap_mode='r')
         if self.embeddings is None:
@@ -81,7 +104,7 @@ class DenseRetriever:
                                                 convert_to_numpy=True, show_progress_bar=True)
             if index_dir:
                 np.save(index_dir / 'embeddings.npy', self.embeddings)
-                meta.write_text(json.dumps({"model": model_name, "corpus": self.fingerprint}))
+                meta.write_text(json.dumps(expected_meta))
 
     def reset(self):
         pass
