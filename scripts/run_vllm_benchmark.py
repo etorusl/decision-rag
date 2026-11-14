@@ -20,6 +20,8 @@ import httpx
 from decision_rag.observability import RunReporter, add_logging_args
 
 ROOT = Path(__file__).resolve().parents[1]
+METHODS = ('bm25', 'dense-vllm', 'dense-rerank-vllm', 'dense-bge-vllm', 'dense-rerank-bge-vllm',
+           'naive-binary-vllm', 'naive-choice-vllm')
 RERANK_OVERRIDES = {
     'architectures': ['Qwen3ForSequenceClassification'],
     'classifier_from_token': ['no', 'yes'], 'is_original_qwen3_reranker': True,
@@ -153,6 +155,11 @@ def main(argv=None):
                         choices=['multidoc2dial', 'conditionalqa', 'mtrag', 'scifact'])
     parser.add_argument('limit', nargs='?', default='100', help='Number of queries, or all')
     parser.add_argument('--ablations', action='store_true')
+    parser.add_argument('--methods', nargs='+', choices=METHODS,
+                        help='Run only selected methods, in canonical suite order')
+    parser.add_argument('--reuse-revisions', help='Reuse immutable revisions from an earlier server-config.json')
+    parser.add_argument('--skip-prepare', action='store_true',
+                        help='Use existing data/<dataset>/corpus.jsonl and queries.jsonl without preparing again')
     parser.add_argument('--run-tag', default=os.getenv('RUN_TAG'))
     parser.add_argument('--naive-model', default=os.getenv('NAIVE_MODEL', 'Qwen/Qwen3-8B'))
     parser.add_argument('--embedding-model', default=os.getenv('EMBEDDING_MODEL', 'Qwen/Qwen3-Embedding-8B'))
@@ -191,6 +198,14 @@ def main(argv=None):
     parser.add_argument('--startup-timeout', type=float, default=1200)
     add_logging_args(parser)
     args = parser.parse_args(argv)
+    if args.methods is not None:
+        if args.ablations:
+            parser.error('--methods cannot be combined with --ablations')
+        if len(args.methods) != len(set(args.methods)):
+            parser.error('--methods must not contain duplicates')
+        if args.skip_bge and any('-bge-' in method for method in args.methods):
+            parser.error('--skip-bge cannot be combined with BGE --methods')
+    args.methods = selected_methods(args)
     throughput = args.execution_mode == 'throughput'
     if args.query_concurrency is None:
         args.query_concurrency = 8 if throughput else 1
@@ -212,8 +227,8 @@ def main(argv=None):
         parser.error('--max-model-len must exceed the 256-token request safety margin')
     if args.decision_max_num_batched_tokens < args.decision_max_num_seqs:
         parser.error('--decision-max-num-batched-tokens must be >= --decision-max-num-seqs')
-    pool_lengths = [] if args.ablations else [args.pool_max_model_len]
-    if not args.ablations and not args.skip_bge:
+    pool_lengths = [args.pool_max_model_len] if set(args.methods) & {'dense-vllm', 'dense-rerank-vllm'} else []
+    if set(args.methods) & {'dense-bge-vllm', 'dense-rerank-bge-vllm'}:
         pool_lengths.append(args.bge_max_model_len)
         if args.pool_max_num_batched_tokens is not None and args.pool_max_num_batched_tokens < args.bge_max_model_len:
             parser.error('--pool-max-num-batched-tokens must be >= --bge-max-model-len (BGE has no chunked prefill)')
@@ -251,7 +266,40 @@ def main(argv=None):
 
 
 def benchmark_count(args):
-    return 7 if args.ablations or not args.skip_bge else 5
+    return 7 if args.ablations else len(selected_methods(args))
+
+
+def selected_methods(args):
+    if args.ablations:
+        return []
+    requested = METHODS if args.methods is None else args.methods
+    return [method for method in METHODS if method in requested and not (args.skip_bge and '-bge-' in method)]
+
+
+def required_models(args):
+    if args.ablations:
+        return [args.naive_model]
+    dependencies = {
+        'bm25': [], 'dense-vllm': [args.embedding_model],
+        'dense-rerank-vllm': [args.embedding_model, args.reranker_model],
+        'dense-bge-vllm': [args.bge_embedding_model],
+        'dense-rerank-bge-vllm': [args.bge_embedding_model, args.bge_reranker_model],
+        'naive-binary-vllm': [args.naive_model], 'naive-choice-vllm': [args.naive_model],
+    }
+    return list(dict.fromkeys(model for method in selected_methods(args) for model in dependencies[method]))
+
+
+def reused_revisions(config_path, models):
+    config = json.loads(Path(config_path).read_text())
+    if not isinstance(config, dict) or not isinstance(config.get('revisions'), dict):
+        raise ValueError('Previous server config must contain a revisions mapping')  # noqa: TRY004
+    revisions = {}
+    for model in models:
+        revision = config['revisions'].get(model)
+        if not isinstance(revision, str) or not re.fullmatch('[0-9a-fA-F]{40}', revision):
+            raise ValueError(f'Previous server config lacks an immutable revision for {model}')
+        revisions[model] = revision
+    return revisions
 
 
 def cached_revisions(manifest_path, models):
@@ -283,16 +331,26 @@ def cached_revisions(manifest_path, models):
 
 
 def run_suite(args, executable, run_dir, reporter):
-    models = [args.naive_model] if args.ablations else [args.naive_model, args.embedding_model, args.reranker_model]
-    if not args.ablations and not args.skip_bge:
-        models += [args.bge_embedding_model, args.bge_reranker_model]
+    if args.skip_prepare:
+        for filename in ('corpus.jsonl', 'queries.jsonl'):
+            path = ROOT / 'data' / args.dataset / filename
+            if not path.is_file():
+                raise ValueError(f'--skip-prepare requires existing dataset file: {path}')
+    models = required_models(args)
     revisions = {}
     model_env = {}
-    if args.model_manifest:
+    reused = reused_revisions(args.reuse_revisions, models) if args.reuse_revisions else None
+    if args.model_manifest and models:
         with reporter.phase('Checking downloaded model snapshots', total=1, unit='manifest') as progress:
             revisions, model_env = cached_revisions(args.model_manifest, models)
+            if reused is not None:
+                for model in models:
+                    if revisions[model] != reused[model]:
+                        raise ValueError(f'Model manifest revision for {model} differs from --reuse-revisions')
             progress.update(models=len(revisions))
-    else:
+    elif reused is not None:
+        revisions = reused
+    elif models:
         from huggingface_hub import HfApi
         api = HfApi()
         with reporter.phase('Resolving model revisions', total=len(set(models)), unit='model') as progress:
@@ -304,8 +362,11 @@ def run_suite(args, executable, run_dir, reporter):
     def run(*command, use_cached_models=False):
         subprocess.run([str(x) for x in command], check=True,
                        env=subprocess_environment(args.gpu_index, model_env if use_cached_models else None))
-    with reporter.phase(f'Preparing {args.dataset}'):
-        run(*cli, 'prepare', args.dataset, '--output', f'data/{args.dataset}')
+    if args.skip_prepare:
+        reporter.event('dataset_reused', f'Reusing prepared {args.dataset}', dataset=args.dataset)
+    else:
+        with reporter.phase(f'Preparing {args.dataset}'):
+            run(*cli, 'prepare', args.dataset, '--output', f'data/{args.dataset}')
     common = ['--corpus', f'data/{args.dataset}/corpus.jsonl', '--queries', f'data/{args.dataset}/queries.jsonl',
               '--top-k', '20', '--warmup', '2', '--gpu-monitor-index', args.gpu_index,
               '--execution-mode', args.execution_mode, '--query-concurrency', str(args.query_concurrency),
@@ -328,6 +389,9 @@ def run_suite(args, executable, run_dir, reporter):
                        benchmark=name, completed=completed, total=total, **selected,
                        benchmark_seconds=time.monotonic() - started)
     def pooling_pair(embedding_model, reranker_model, suffix, log_directory, max_model_len):
+        dense_name, rerank_name = f'dense{suffix}-vllm', f'dense-rerank{suffix}-vllm'
+        if not set(args.methods) & {dense_name, rerank_name}:
+            return
         with Servers(log_directory, executable, args.startup_timeout, args.gpu_index, reporter,
                      model_env=model_env) as servers:
             embedding_url = servers.start(embedding_model, revisions[embedding_model], args.port_base + 1,
@@ -338,39 +402,45 @@ def run_suite(args, executable, run_dir, reporter):
                      '--search-device', args.search_device,
                      '--embedding-revision', revisions[embedding_model], '--index-dir',
                      f'cache/vllm-dense/{args.dataset}/{embedding_model.replace("/", "_")}-{revisions[embedding_model]}']
-            benchmark(f'dense{suffix}-vllm', ['--method', 'dense', *dense])
-            reranker_url = servers.start(reranker_model, revisions[reranker_model], args.port_base + 2,
-                                         'reranker', args.pool_memory, max_model_len,
-                                         max_num_seqs=args.pool_max_num_seqs,
-                                         max_num_batched_tokens=args.pool_max_num_batched_tokens)
-            benchmark(f'dense-rerank{suffix}-vllm', ['--method', 'dense-rerank', *dense,
-                      '--reranker-model', reranker_model, '--reranker-url', reranker_url,
-                      '--reranker-revision', revisions[reranker_model]])
+            if dense_name in args.methods:
+                benchmark(dense_name, ['--method', 'dense', *dense])
+            if rerank_name in args.methods:
+                reranker_url = servers.start(reranker_model, revisions[reranker_model], args.port_base + 2,
+                                             'reranker', args.pool_memory, max_model_len,
+                                             max_num_seqs=args.pool_max_num_seqs,
+                                             max_num_batched_tokens=args.pool_max_num_batched_tokens)
+                benchmark(rerank_name, ['--method', 'dense-rerank', *dense,
+                          '--reranker-model', reranker_model, '--reranker-url', reranker_url,
+                          '--reranker-revision', revisions[reranker_model]])
     if not args.ablations:
-        benchmark('bm25', ['--method', 'bm25', '--search-device', args.search_device])
+        if 'bm25' in args.methods:
+            benchmark('bm25', ['--method', 'bm25', '--search-device', args.search_device])
         pooling_pair(args.embedding_model, args.reranker_model, '', run_dir / 'servers', args.pool_max_model_len)
         if not args.skip_bge:
             pooling_pair(args.bge_embedding_model, args.bge_reranker_model, '-bge', run_dir / 'servers' / 'bge',
                          args.bge_max_model_len)
-    with Servers(run_dir / 'servers', executable, args.startup_timeout, args.gpu_index, reporter,
-                 model_env=model_env) as servers:
-        decision_url = servers.start(args.naive_model, revisions[args.naive_model], args.port_base,
-                                     'decision', args.decision_memory, args.max_model_len,
-                                     max_num_seqs=args.decision_max_num_seqs,
-                                     max_num_batched_tokens=args.decision_max_num_batched_tokens)
-        naive = ['--backend', 'vllm', '--model', args.naive_model, '--model-revision', revisions[args.naive_model],
-                 '--base-url', decision_url, '--max-context-tokens', str(args.max_model_len),
-                 '--max-request-tokens', str(min(30000, args.max_model_len - 256)),
-                 '--preset', 'generic' if args.dataset == 'scifact' else args.dataset]
-        if args.ablations:
-            for pages in (3, 5, 10):
-                benchmark(f'pages-{pages}', [*naive, '--pages', str(pages)])
-            for size in (1, 16, 64):
-                benchmark(f'context-{size}', [*naive, '--max-candidates', str(size)])
-            benchmark('no-memory', [*naive, '--no-memory'])
-        else:
-            benchmark('naive-binary-vllm', [*naive, '--choice-k', '0'])
-            benchmark('naive-choice-vllm', [*naive, '--choice-k', '20'])
+    if args.ablations or set(args.methods) & {'naive-binary-vllm', 'naive-choice-vllm'}:
+        with Servers(run_dir / 'servers', executable, args.startup_timeout, args.gpu_index, reporter,
+                     model_env=model_env) as servers:
+            decision_url = servers.start(args.naive_model, revisions[args.naive_model], args.port_base,
+                                         'decision', args.decision_memory, args.max_model_len,
+                                         max_num_seqs=args.decision_max_num_seqs,
+                                         max_num_batched_tokens=args.decision_max_num_batched_tokens)
+            naive = ['--backend', 'vllm', '--model', args.naive_model, '--model-revision', revisions[args.naive_model],
+                     '--base-url', decision_url, '--max-context-tokens', str(args.max_model_len),
+                     '--max-request-tokens', str(min(30000, args.max_model_len - 256)),
+                     '--preset', 'generic' if args.dataset == 'scifact' else args.dataset]
+            if args.ablations:
+                for pages in (3, 5, 10):
+                    benchmark(f'pages-{pages}', [*naive, '--pages', str(pages)])
+                for size in (1, 16, 64):
+                    benchmark(f'context-{size}', [*naive, '--max-candidates', str(size)])
+                benchmark('no-memory', [*naive, '--no-memory'])
+            else:
+                if 'naive-binary-vllm' in args.methods:
+                    benchmark('naive-binary-vllm', [*naive, '--choice-k', '0'])
+                if 'naive-choice-vllm' in args.methods:
+                    benchmark('naive-choice-vllm', [*naive, '--choice-k', '20'])
     with reporter.phase('Summarizing benchmark results'):
         run(sys.executable, 'scripts/summarize_runs.py', run_dir, '--output', run_dir / 'comparison')
     reporter.event('suite_completed', f'Benchmark suite completed; results: {run_dir}',

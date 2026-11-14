@@ -339,6 +339,120 @@ def test_original_matrix_remains_available_unchanged(fake_run):
     assert [event for event in events if event[0] == 'server_gpu'] == [('server_gpu', '1')] * 2
 
 
+@pytest.mark.parametrize('method,models,kinds', [
+    ('bm25', [], []),
+    ('dense-vllm', ['Qwen/Qwen3-Embedding-8B'], ['embedding']),
+    ('dense-rerank-vllm', ['Qwen/Qwen3-Embedding-8B', 'Qwen/Qwen3-Reranker-8B'], ['embedding', 'reranker']),
+    ('dense-bge-vllm', ['BAAI/bge-m3'], ['embedding']),
+    ('dense-rerank-bge-vllm', ['BAAI/bge-m3', 'BAAI/bge-reranker-v2-m3'], ['embedding', 'reranker']),
+    ('naive-binary-vllm', ['Qwen/Qwen3-8B'], ['decision']),
+    ('naive-choice-vllm', ['Qwen/Qwen3-8B'], ['decision']),
+])
+def test_selected_method_only_resolves_and_starts_its_dependencies(fake_run, monkeypatch, tmp_path,
+                                                               method, models, kinds):
+    calls, events, _ = fake_run
+    resolved = []
+    def model_info(model):
+        resolved.append(model)
+        return SimpleNamespace(sha='c' * 40)
+    def api():
+        assert models, 'BM25 must not construct a Hugging Face client'
+        return SimpleNamespace(model_info=model_info)
+    monkeypatch.setitem(sys.modules, 'huggingface_hub', SimpleNamespace(HfApi=api))
+    runner.main(['scifact', '3', '--run-tag', 'selected', '--methods', method])
+    benchmarks = [call for call in calls if 'benchmark' in call]
+    assert [Path(option(call, '--output')).name for call in benchmarks] == [method]
+    assert resolved == models
+    assert [event[1] for event in events if event[0] == 'start'] == kinds
+    commands = [event[1] for event in events if event[0] == 'server_command']
+    assert [command[2] for command in commands] == models
+    config = json.loads((tmp_path / 'results/selected/scifact/server-config.json').read_text())
+    assert config['methods'] == [method]
+    assert config['revisions'] == dict.fromkeys(models, 'c' * 40)
+    records = [json.loads(line) for line in (tmp_path / 'results/selected/scifact/events.jsonl').read_text().splitlines()]
+    completed = next(record for record in records if record['event'] == 'suite_completed')
+    assert completed['completed'] == completed['total'] == 1
+
+
+def test_selected_methods_keep_canonical_order_and_share_decision_server(fake_run):
+    calls, events, _ = fake_run
+    runner.main(['scifact', '3', '--run-tag', 'ordered', '--methods',
+                 'naive-choice-vllm', 'bm25', 'naive-binary-vllm'])
+    benchmarks = [call for call in calls if 'benchmark' in call]
+    assert [Path(option(call, '--output')).name for call in benchmarks] == [
+        'bm25', 'naive-binary-vllm', 'naive-choice-vllm']
+    assert [event for event in events if event[0] == 'start'] == [('start', 'decision')]
+
+
+@pytest.mark.parametrize('options', [
+    ['--methods', 'bm25', 'bm25'],
+    ['--methods', 'naive-binary-vllm', '--ablations'],
+    ['--methods', 'dense-bge-vllm', '--skip-bge'],
+    ['--methods', 'dense-rerank-bge-vllm', '--skip-bge'],
+])
+def test_incompatible_method_selection_fails_before_launch(fake_run, options):
+    calls, events, _ = fake_run
+    with pytest.raises(SystemExit):
+        runner.main(['multidoc2dial', '3', '--run-tag', 'invalid-methods', *options])
+    assert not calls and not events
+
+
+def test_reuse_revisions_uses_exact_previous_pin_without_online_resolution(fake_run, monkeypatch, tmp_path):
+    calls, events, _ = fake_run
+    previous = tmp_path / 'previous-server-config.json'
+    previous.write_text(json.dumps({'revisions': {'Qwen/Qwen3-8B': 'd' * 40,
+                                                 'unused/model': 'mutable-unused-value'}}))
+    monkeypatch.setitem(sys.modules, 'huggingface_hub', SimpleNamespace(
+        HfApi=lambda: pytest.fail('Reusing revisions must not query Hugging Face')))
+    runner.main(['scifact', '3', '--run-tag', 'reuse', '--reuse-revisions', str(previous),
+                 '--methods', 'naive-binary-vllm', 'naive-choice-vllm'])
+    benchmarks = [call for call in calls if 'benchmark' in call]
+    assert all(option(call, '--model-revision') == 'd' * 40 for call in benchmarks)
+    commands = [event[1] for event in events if event[0] == 'server_command']
+    assert len(commands) == 1 and option(commands[0], '--revision') == 'd' * 40
+    config = json.loads((tmp_path / 'results/reuse/scifact/server-config.json').read_text())
+    assert config['revisions'] == {'Qwen/Qwen3-8B': 'd' * 40}
+
+
+@pytest.mark.parametrize('revisions', [{}, {'Qwen/Qwen3-8B': 'main'}, [], {'Qwen/Qwen3-8B': 1 * 10**39}])
+def test_invalid_previous_pins_fail_before_prepare_or_servers(fake_run, tmp_path, revisions):
+    calls, events, _ = fake_run
+    previous = tmp_path / 'previous-server-config.json'
+    previous.write_text(json.dumps({'revisions': revisions}))
+    with pytest.raises(ValueError, match='revision'):
+        runner.main(['scifact', '3', '--run-tag', 'invalid-pins', '--reuse-revisions', str(previous),
+                     '--methods', 'naive-binary-vllm'])
+    assert not calls and not events
+
+
+def test_skip_prepare_reuses_existing_dataset_bytes(fake_run, tmp_path):
+    calls, _, _ = fake_run
+    data = tmp_path / 'data/scifact'
+    data.mkdir(parents=True)
+    for filename in ('corpus.jsonl', 'queries.jsonl'):
+        (data / filename).write_text('preserve existing prepared bytes\n')
+    runner.main(['scifact', '3', '--run-tag', 'prepared', '--methods', 'bm25', '--skip-prepare'])
+    assert not any('prepare' in call for call in calls)
+    assert all((data / filename).read_text() == 'preserve existing prepared bytes\n'
+               for filename in ('corpus.jsonl', 'queries.jsonl'))
+    benchmark = next(call for call in calls if 'benchmark' in call)
+    assert option(benchmark, '--corpus') == 'data/scifact/corpus.jsonl'
+    assert option(benchmark, '--queries') == 'data/scifact/queries.jsonl'
+
+
+@pytest.mark.parametrize('missing', ['corpus.jsonl', 'queries.jsonl'])
+def test_skip_prepare_fails_before_resolution_if_dataset_file_is_missing(fake_run, tmp_path, monkeypatch, missing):
+    calls, events, _ = fake_run
+    data = tmp_path / 'data/scifact'
+    data.mkdir(parents=True)
+    (data / ('corpus.jsonl' if missing == 'queries.jsonl' else 'queries.jsonl')).touch()
+    monkeypatch.setitem(sys.modules, 'huggingface_hub', SimpleNamespace(
+        HfApi=lambda: pytest.fail('Missing prepared files must be rejected before model resolution')))
+    with pytest.raises(ValueError, match=missing):
+        runner.main(['scifact', '3', '--run-tag', 'missing-data', '--skip-prepare'])
+    assert not calls and not events
+
+
 def make_manifest(tmp_path):
     models = ['Qwen/Qwen3-8B', 'Qwen/Qwen3-Embedding-8B', 'Qwen/Qwen3-Reranker-8B',
               'BAAI/bge-m3', 'BAAI/bge-reranker-v2-m3']
@@ -352,6 +466,30 @@ def make_manifest(tmp_path):
     path = tmp_path / 'manifest.json'
     path.write_text(json.dumps({'format_version': 1, 'cache_dir': str(cache), 'models': entries}))
     return path
+
+
+@pytest.mark.parametrize('same_revision', [True, False])
+def test_selected_model_manifest_must_match_reused_revision(fake_run, tmp_path, monkeypatch, same_revision):
+    calls, events, _ = fake_run
+    manifest = make_manifest(tmp_path)
+    document = json.loads(manifest.read_text())
+    document['models'] = {'Qwen/Qwen3-8B': document['models']['Qwen/Qwen3-8B']}
+    manifest.write_text(json.dumps(document))
+    previous = tmp_path / 'previous-server-config.json'
+    previous.write_text(json.dumps({'revisions': {'Qwen/Qwen3-8B': ('b' if same_revision else 'c') * 40}}))
+    monkeypatch.setitem(sys.modules, 'huggingface_hub', SimpleNamespace(
+        HfApi=lambda: pytest.fail('Pinned model selection must not query Hugging Face')))
+    arguments = ['scifact', '3', '--run-tag', 'manifest-pins', '--methods', 'naive-binary-vllm',
+                 '--model-manifest', str(manifest), '--reuse-revisions', str(previous)]
+    if same_revision:
+        runner.main(arguments)
+        benchmark = next(call for call in calls if 'benchmark' in call)
+        assert option(benchmark, '--model-revision') == 'b' * 40
+        assert [event for event in events if event[0] == 'start'] == [('start', 'decision')]
+    else:
+        with pytest.raises(ValueError, match='differs'):
+            runner.main(arguments)
+        assert not calls and not events
 
 
 @pytest.mark.parametrize('use_manifest', [True, False])

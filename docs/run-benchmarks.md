@@ -168,6 +168,51 @@ Serial QPS относится только к последовательному
 
 ## 5. Дополнительные прогоны
 
+### Восстановить прерванный suite с новым concurrency
+
+Обновите код и укажите прежний каталог датасета. Например:
+
+```bash
+git pull --ff-only
+.venv-vllm/bin/python scripts/resume_vllm_benchmark.py \
+  results/OLD_TAG/multidoc2dial \
+  --execution-mode throughput --query-concurrency 8
+```
+
+`--dry-run` покажет план без запуска серверов и записи файлов. Готовым считается метод
+с корректными `summary.json` и полным набором записей `queries.jsonl`. Скрипт проверяет
+выборку и хеши текущих данных по завершённым результатам, сохраняет прежние model IDs,
+revision SHA, query limit и retrieval context limits. Подготовка датасета повторно не запускается.
+Используется прежний model manifest, если он был указан; его новый путь можно передать
+через `--model-manifest`. Без manifest точные SHA берутся из старого `server-config.json`.
+
+Завершённые BM25/dense/naive методы пропускаются. Частично выполненный метод запускается
+**с начала** в новом каталоге: частичные timings со старым режимом не смешиваются с новым
+throughput, а память диалогов строится заново в правильном порядке. Старый каталог,
+включая незавершённые запросы, остаётся нетронутым. Если всё уже завершено, серверы не запускаются.
+Если нет ни одного готового метода, исторические хеши проверить нельзя; это явно отражено
+как `data_hash_validation: unavailable`, и все незавершённые методы запускаются заново.
+
+Новые результаты находятся в `results/<old-tag>-resume-c8-<timestamp>/<dataset>/`.
+Внутри создаются `recovery-plan.json` и общий `recovery-comparison.md/.csv`, который объединяет
+только проверенные старые результаты и новые завершённые методы. Старые latency и новые
+throughput строки подписаны отдельно: их время относится к разным режимам нагрузки.
+
+Для ручного запуска только выбранных методов в новом suite:
+
+```bash
+bash scripts/benchmark_h100.sh multidoc2dial all \
+  --methods naive-binary-vllm naive-choice-vllm \
+  --model-manifest cache/model-manifest.json \
+  --execution-mode throughput --query-concurrency 8
+```
+
+Runner поднимет только decision-сервер. Он также поддерживает `--reuse-revisions PATH`
+для точных SHA из старого `server-config.json` и `--skip-prepare` для готовых локальных данных.
+При совместном использовании manifest и старых SHA несовпадение версий считается ошибкой.
+
+### Подбор concurrency и другие проверки
+
 Подбор query concurrency на одной и той же выборке; suites запускаются последовательно,
 каждая настройка получает собственный tag. Scheduler limits и retrieval budgets остаются
 одинаковыми во всех пяти throughput-прогонах, включая concurrency 1:
