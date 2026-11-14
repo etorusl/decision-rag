@@ -12,7 +12,9 @@ import importlib.metadata
 import json
 import math
 import random
+import time
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import torch
@@ -26,6 +28,7 @@ from .backends.decision_head import (
     resolve_attention,
     resolve_dtype,
 )
+from .observability import RunReporter, add_logging_args
 
 
 @dataclass
@@ -144,6 +147,8 @@ def train_records(
     *,
     config: TrainingConfig | None = None,
     dev_path: str | Path | None = None,
+    progress: str = "auto",
+    log_interval: float = 30.0,
     **overrides,
 ) -> dict:
     """Train a checkpoint; keyword overrides are TrainingConfig fields.
@@ -151,8 +156,6 @@ def train_records(
     JSONL: {context, questions:[str], options:[[str]], labels:[zero-based int]}.
     Full records that exceed the configured budgets are dropped, never truncated.
     """
-    from transformers import AutoConfig, AutoModel, AutoTokenizer
-
     if config is not None and overrides:
         raise ValueError("Pass a TrainingConfig or keyword settings, not both")
     config = config or TrainingConfig(**overrides)
@@ -168,39 +171,52 @@ def train_records(
     if output.exists() and any(output.iterdir()):
         raise ValueError(f"Output directory is not empty: {output}; use a new checkpoint directory")
     output.mkdir(parents=True, exist_ok=True)
+    with RunReporter(output, progress=progress, log_interval=log_interval, name="training") as reporter:
+        reporter.event("training_started", model=config.model_name, mode=config.mode, device=config.device,
+                       train_path=str(train_path), dev_path=str(dev_path) if dev_path else None)
+        summary = _train_records(train_path, output, config, dev_path, reporter)
+        reporter.event("training_completed", trained_steps=summary["trained_steps"],
+                       optimizer_updates=summary["optimizer_updates"], checkpoint=str(output))
+        return summary
+
+
+def _train_records(train_path, output, config, dev_path, reporter):
+    from transformers import AutoConfig, AutoModel, AutoTokenizer
+
     torch.manual_seed(config.seed)
     random.seed(config.seed)
     attention = resolve_attention(config.device, config.attention)
-    model_config = AutoConfig.from_pretrained(config.model_name)
-    config.max_context_tokens = min(config.max_context_tokens, model_config.max_position_embeddings)
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    with reporter.phase("Load tokenizer and model config", model=config.model_name):
+        model_config = AutoConfig.from_pretrained(config.model_name)
+        config.max_context_tokens = min(config.max_context_tokens, model_config.max_position_embeddings)
+        tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     records = JsonlRecords(train_path)
     eligible, dropped = [], 0
-    for i in range(len(records)):
-        row = records[i]
-        try:
-            layout = _record_layout(tokenizer, row, config)
-            if attention != "flex_attention" and layout.length > 4096:
-                raise ValueError("CPU dense mask length limit")
-        except ValueError as exc:
-            if not any(word in str(exc) for word in ("exceeds", "limit", "Packed")):
-                raise
-            dropped += 1
-            continue
-        eligible.append(i)
+    with reporter.phase("Check training records", total=len(records), unit="record") as stage:
+        for i in range(len(records)):
+            row = records[i]
+            try:
+                layout = _record_layout(tokenizer, row, config)
+                if attention != "flex_attention" and layout.length > 4096:
+                    raise ValueError("CPU dense mask length limit")
+            except ValueError as exc:
+                if not any(word in str(exc) for word in ("exceeds", "limit", "Packed")):
+                    raise
+                dropped += 1
+            else:
+                eligible.append(i)
+            stage.update(eligible=len(eligible), dropped=dropped)
     if not eligible:
         raise ValueError(
             "All training records exceed token budgets; increase limits or prepare smaller requests"
         )
-    print(
-        json.dumps({"event": "preflight", "eligible_records": len(eligible), "dropped_overlong": dropped}),
-        flush=True,
-    )
-    backbone = AutoModel.from_pretrained(
-        config.model_name,
-        torch_dtype=resolve_dtype(config.dtype),
-        attn_implementation=attention,
-    )
+    reporter.event("preflight", eligible_records=len(eligible), dropped_overlong=dropped)
+    with reporter.phase("Load backbone", model=config.model_name):
+        backbone = AutoModel.from_pretrained(
+            config.model_name,
+            torch_dtype=resolve_dtype(config.dtype),
+            attn_implementation=attention,
+        )
     check_model(backbone)
     if config.mode == "lora":
         from peft import LoraConfig, TaskType, get_peft_model
@@ -247,12 +263,13 @@ def train_records(
     (output / "training_config.json").write_text(json.dumps({**asdict(config), **summary}, indent=2) + "\n")
     steps, processed = 0, 0
     log_path = output / "train_log.jsonl"
+    training_start = time.perf_counter()
 
     def log(row):
-        row = {"step": steps, **row}
+        row = {"timestamp": datetime.now(UTC).isoformat(), "elapsed_seconds": time.perf_counter() - training_start,
+               "step": steps, **row}
         with log_path.open("a") as stream:
             stream.write(json.dumps(row) + "\n")
-        print(json.dumps(row), flush=True)
 
     # Optional stable head initialization while retaining the same packed examples.
     if config.head_only_steps:
@@ -263,16 +280,20 @@ def train_records(
         head_optimizer = torch.optim.AdamW(
             model.head.parameters(), lr=config.head_only_learning_rate, betas=(0.9, 0.95), weight_decay=0.0
         )
-        for step in range(config.head_only_steps):
-            row = records[eligible[step % len(eligible)]]
-            layout = _record_layout(tokenizer, row, config)
-            head_optimizer.zero_grad(set_to_none=True)
-            loss, _ = _loss(model, layout, row["labels"], attention)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.head.parameters(), 1.0)
-            head_optimizer.step()
-            steps += 1
-            log({"phase": "head_warmup", "loss": float(loss.detach())})
+        with reporter.phase("Head warmup", total=config.head_only_steps, unit="step") as stage:
+            for step in range(config.head_only_steps):
+                row = records[eligible[step % len(eligible)]]
+                layout = _record_layout(tokenizer, row, config)
+                head_optimizer.zero_grad(set_to_none=True)
+                loss, _ = _loss(model, layout, row["labels"], attention)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.head.parameters(), 1.0)
+                head_optimizer.step()
+                steps += 1
+                loss_value = float(loss.detach())
+                log({"phase": "head_warmup", "loss": loss_value,
+                     "learning_rate": config.head_only_learning_rate})
+                stage.update(loss=loss_value, learning_rate=config.head_only_learning_rate)
         for p in backbone_parameters:
             p.requires_grad_(True)
         del head_optimizer
@@ -299,48 +320,55 @@ def train_records(
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, multiplier)
     updates = 0
-    for epoch in range(config.epochs):
-        order = list(eligible)
-        random.Random(config.seed + epoch).shuffle(order)
-        model.train()
-        if config.mode == "head":
-            model.backbone.eval()
-        for start in range(0, len(order), config.gradient_accumulation):
-            batch = order[start : start + config.gradient_accumulation]
-            optimizer.zero_grad(set_to_none=True)
-            batch_loss = 0.0
-            for index in batch:
-                row = records[index]
-                layout = _record_layout(tokenizer, row, config)
-                loss, _ = _loss(model, layout, row["labels"], attention)
-                (loss / len(batch)).backward()
-                batch_loss += float(loss.detach()) / len(batch)
-                processed += 1
-            torch.nn.utils.clip_grad_norm_(all_trainable, 1.0)
-            optimizer.step()
-            scheduler.step()
-            updates += 1
-            steps += 1
-            log(
-                {
-                    "phase": "train",
-                    "epoch": epoch + 1,
-                    "loss": batch_loss,
-                    "learning_rate": scheduler.get_last_lr()[0],
-                    "processed_records": processed,
-                }
-            )
-            if config.save_every > 0 and updates % config.save_every == 0:
-                _save(model, tokenizer, output / f"step-{steps}", config, steps, summary)
+    with reporter.phase("Train", total=total_steps, unit="step", mode=config.mode) as stage:
+        for epoch in range(config.epochs):
+            order = list(eligible)
+            random.Random(config.seed + epoch).shuffle(order)
+            model.train()
+            if config.mode == "head":
+                model.backbone.eval()
+            for start in range(0, len(order), config.gradient_accumulation):
+                batch = order[start : start + config.gradient_accumulation]
+                optimizer.zero_grad(set_to_none=True)
+                batch_loss = 0.0
+                for index in batch:
+                    row = records[index]
+                    layout = _record_layout(tokenizer, row, config)
+                    loss, _ = _loss(model, layout, row["labels"], attention)
+                    (loss / len(batch)).backward()
+                    batch_loss += float(loss.detach()) / len(batch)
+                    processed += 1
+                torch.nn.utils.clip_grad_norm_(all_trainable, 1.0)
+                optimizer.step()
+                scheduler.step()
+                updates += 1
+                steps += 1
+                learning_rate = scheduler.get_last_lr()[0]
+                log(
+                    {
+                        "phase": "train",
+                        "epoch": epoch + 1,
+                        "loss": batch_loss,
+                        "learning_rate": learning_rate,
+                        "processed_records": processed,
+                    }
+                )
+                stage.update(loss=batch_loss, learning_rate=learning_rate,
+                             epoch=epoch + 1, processed_records=processed)
+                if config.save_every > 0 and updates % config.save_every == 0:
+                    checkpoint = output / f"step-{steps}"
+                    with reporter.phase("Save checkpoint", checkpoint=str(checkpoint), step=steps):
+                        _save(model, tokenizer, checkpoint, config, steps, summary)
+                if updates >= total_steps:
+                    break
             if updates >= total_steps:
                 break
-        if updates >= total_steps:
-            break
     if dev_path:
         dev = JsonlRecords(dev_path)
         losses, correct, count, dev_dropped = [], 0, 0, 0
+        validation_loss = 0.0
         model.eval()
-        with torch.inference_mode():
+        with torch.inference_mode(), reporter.phase("Validate", total=len(dev), unit="record") as stage:
             for i in range(len(dev)):
                 row = dev[i]
                 try:
@@ -351,11 +379,15 @@ def train_records(
                     if not any(word in str(exc) for word in ("exceeds", "limit", "Packed")):
                         raise
                     dev_dropped += 1
+                    stage.update(dropped=dev_dropped)
                     continue
                 loss, logits = _loss(model, layout, row["labels"], attention)
                 losses.append(float(loss))
+                validation_loss += losses[-1]
                 correct += sum(int(scores.argmax()) == label for scores, label in zip(logits, row["labels"]))
                 count += len(row["labels"])
+                stage.update(loss=validation_loss / len(losses), accuracy=correct / count,
+                             questions=count, dropped=dev_dropped)
         summary["validation"] = {
             "mean_record_loss": sum(losses) / len(losses) if losses else None,
             "accuracy": correct / count if count else None,
@@ -363,8 +395,10 @@ def train_records(
             "dropped_overlong_records": dev_dropped,
         }
         log({"phase": "validation", **summary["validation"]})
+        reporter.event("validation_completed", **summary["validation"])
     summary.update({"trained_steps": steps, "optimizer_updates": updates, "processed_records": processed})
-    _save(model, tokenizer, output, config, steps, summary)
+    with reporter.phase("Save final checkpoint", checkpoint=str(output), step=steps):
+        _save(model, tokenizer, output, config, steps, summary)
     return summary
 
 
@@ -393,6 +427,7 @@ def main(argv=None):
     parser.add_argument("--option-links", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-every", type=int, default=500)
+    add_logging_args(parser)
     args = vars(parser.parse_args(argv))
     train, dev, output = args.pop("train"), args.pop("dev"), args.pop("output")
     args["model_name"] = args.pop("model")

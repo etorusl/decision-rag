@@ -119,6 +119,36 @@ vLLM (`--engine vllm`). Прежняя реализация доступна я�
 
 Сохраняются timings, запросы, параметры, версии, hashes, server logs и model revisions.
 Сравнивайте одни и те же corpus/query SHA и precision. Для повторов задавайте разные `RUN_TAG`.
+
+## Прогресс и логи
+
+В терминале автоматически появляются progress bars прогрева и запросов: выполнено/всего,
+скорость, elapsed/ETA и текущие метрики. Runner сообщает, какой из пяти бенчмарков
+(семи для абляций) выполняется, и показывает ожидание запуска vLLM с путём к server log.
+Общая ETA для разных методов не вычисляется: их скорость различается.
+
+В `results/<RUN_TAG>/<dataset>/` сохраняются `run.log` и `events.jsonl` всего прогона;
+в каталоге каждого метода — собственные `run.log`, `events.jsonl`, `queries.jsonl` и `summary.json`.
+Traceback при ошибке остаётся в логах. stdout/stderr серверов vLLM находятся в `servers/*.log`.
+Логирование и обновление progress bar выполняются вне измеряемого retrieval-интервала.
+
+`--progress auto` — значение по умолчанию; `on` принудительно включает bars,
+`off` оставляет обычные строки. Без TTY (например, `nohup` или перенаправление в файл)
+режим `auto` выводит обычные строки прогресса каждые 30 секунд, а начала/концы этапов — сразу.
+Интервал задаёт `--log-interval`; те же параметры доступны у `decision-rag benchmark`.
+
+```bash
+bash scripts/benchmark_h100.sh multidoc2dial 100 --progress auto --log-interval 10
+
+# Запуск после выхода из SSH; каталог results создайте до перенаправления:
+mkdir -p results
+RUN_TAG=md2d-full nohup bash scripts/benchmark_h100.sh multidoc2dial all \
+  --progress off --log-interval 30 > results/md2d-full-console.log 2>&1 &
+tail -f results/md2d-full-console.log
+```
+
+Общие настройки CLI можно задать через `DECISION_RAG_PROGRESS` и `DECISION_RAG_LOG_INTERVAL`.
+
 CUDA/vLLM inference на H100 пока не запускался из этой CPU-среды; HTTP-контракты и маршрутизация
 проверяются тестами, фактическую скорость покажет серверный прогон.
 

@@ -11,6 +11,7 @@ import math
 import re
 import time
 from collections.abc import Sequence
+from contextlib import nullcontext
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -117,7 +118,7 @@ class VLLMDenseRetriever:
     def __init__(self, corpus, model_name="Qwen/Qwen3-Embedding-8B", *,
                  base_url="http://127.0.0.1:8001", top_k=20, batch_size=16,
                  index_dir=None, revision=None, timeout=120, client=None,
-                 dtype="bfloat16", quantization=None):
+                 dtype="bfloat16", quantization=None, reporter=None):
         if min(top_k, batch_size) <= 0:
             raise ValueError("top_k and batch_size must be positive")
         if not corpus.passages:
@@ -160,24 +161,31 @@ class VLLMDenseRetriever:
                 self.embeddings = np.load(directory / "embeddings.npy", mmap_mode="r", allow_pickle=False)
                 if self.embeddings.ndim != 2 or self.embeddings.shape[0] != len(self.passages):
                     raise ValueError("Cached embedding index shape does not match corpus")
+                if reporter:
+                    reporter.event('index_cache_loaded', 'Reusing corpus embedding index',
+                                   passages=len(self.passages), index_dir=str(directory))
         if self.embeddings is None:
             chunks = []
             partial = directory / "embeddings.partial.npy" if directory else None
-            for start in range(0, len(self.passages), batch_size):
-                texts = [self._document_text(p.text) for p in self.passages[start:start + batch_size]]
-                array, usage = self._embed(texts)
-                self.indexing_usage.append(usage)
-                if start == 0 and partial:
-                    self.embeddings = np.lib.format.open_memmap(partial, mode="w+", dtype=np.float32,
-                                                               shape=(len(self.passages), array.shape[1]))
-                if self.embeddings is not None:
-                    if array.shape[1] != self.embeddings.shape[1]:
-                        raise ValueError("Embedding dimensions changed while building index")
-                    self.embeddings[start:start + len(array)] = array
-                else:
-                    if chunks and array.shape[1] != chunks[0].shape[1]:
-                        raise ValueError("Embedding dimensions changed while building index")
-                    chunks.append(array)
+            phase = reporter.phase('Building embedding index', total=len(self.passages), unit='passage') if reporter else nullcontext()
+            with phase as progress:
+                for start in range(0, len(self.passages), batch_size):
+                    texts = [self._document_text(p.text) for p in self.passages[start:start + batch_size]]
+                    array, usage = self._embed(texts)
+                    self.indexing_usage.append(usage)
+                    if start == 0 and partial:
+                        self.embeddings = np.lib.format.open_memmap(partial, mode="w+", dtype=np.float32,
+                                                                   shape=(len(self.passages), array.shape[1]))
+                    if self.embeddings is not None:
+                        if array.shape[1] != self.embeddings.shape[1]:
+                            raise ValueError("Embedding dimensions changed while building index")
+                        self.embeddings[start:start + len(array)] = array
+                    else:
+                        if chunks and array.shape[1] != chunks[0].shape[1]:
+                            raise ValueError("Embedding dimensions changed while building index")
+                        chunks.append(array)
+                    if progress:
+                        progress.update(len(texts), batches=len(self.indexing_usage))
             if partial:
                 self.embeddings.flush()
                 del self.embeddings
@@ -275,14 +283,14 @@ class VLLMDenseRerankRetriever:
                  embedding_base_url="http://127.0.0.1:8001", reranker_base_url="http://127.0.0.1:8002",
                  top_k=20, candidates=100, batch_size=16, index_dir=None,
                  embedding_revision=None, reranker_revision=None, timeout=120,
-                 embedding_client=None, reranker_client=None, dtype="bfloat16", quantization=None):
+                 embedding_client=None, reranker_client=None, dtype="bfloat16", quantization=None, reporter=None):
         if top_k <= 0 or candidates < top_k:
             raise ValueError("Require 0 < top_k <= candidates")
         self.corpus, self.top_k = corpus, top_k
         self.dense = VLLMDenseRetriever(corpus, embedding_model, base_url=embedding_base_url,
                                        top_k=candidates, batch_size=batch_size, index_dir=index_dir,
                                        revision=embedding_revision, timeout=timeout, client=embedding_client,
-                                       dtype=dtype, quantization=quantization)
+                                       dtype=dtype, quantization=quantization, reporter=reporter)
         self.reranker = VLLMQwenReranker(reranker_model, base_url=reranker_base_url,
                                         batch_size=batch_size, revision=reranker_revision,
                                         timeout=timeout, client=reranker_client)

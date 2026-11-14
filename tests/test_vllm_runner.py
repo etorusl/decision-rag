@@ -121,6 +121,27 @@ def test_cleanup_escalates_only_owned_group_and_is_idempotent(monkeypatch, tmp_p
     assert log.closed
 
 
+def test_logging_failure_does_not_interrupt_remaining_server_cleanup(monkeypatch, tmp_path):
+    killed = []
+    monkeypatch.setattr(runner.os, 'killpg', lambda *args: killed.append(args))
+    class FailingReporter:
+        def event(self, *args, **kwargs):
+            raise OSError('log filesystem is full')
+
+    processes = [Process(pid=4321), Process(pid=4322)]
+    logs = [(tmp_path / f'{process.pid}.log').open('w') for process in processes]
+    servers = runner.Servers(tmp_path, 'vllm', reporter=FailingReporter())
+    servers.processes.extend(zip(processes, logs, strict=True))
+    with pytest.raises(OSError, match='filesystem is full'):
+        servers.close()
+    assert killed == [(4322, signal.SIGTERM), (4321, signal.SIGTERM)]
+    assert all(process.waits == [30] for process in processes)
+    assert all(log.closed for log in logs)
+    assert servers.processes == []
+    servers.close()  # no stale processes or repeated logging failures
+    assert len(killed) == 2
+
+
 def test_readiness_requires_requested_model(monkeypatch, tmp_path):
     monkeypatch.setattr(runner.socket, "socket", lambda: Probe())
     monkeypatch.setattr(runner.subprocess, "Popen", lambda *a, **k: Process())
@@ -139,6 +160,21 @@ def test_readiness_requires_requested_model(monkeypatch, tmp_path):
     assert all(request.url.path == "/v1/models" for request in requests)
 
 
+def test_server_startup_failure_preserves_log_location_and_traceback(monkeypatch, tmp_path):
+    monkeypatch.setattr(runner.socket, 'socket', lambda: Probe())
+    monkeypatch.setattr(runner.subprocess, 'Popen', lambda *a, **k: Process(running=False))
+    monkeypatch.setattr(runner.os, 'killpg', lambda *a: None)
+    with pytest.raises(RuntimeError, match='server exited'), runner.RunReporter(
+        tmp_path, progress='off', name='benchmark-suite'
+    ) as reporter, runner.Servers(tmp_path / 'servers', 'vllm', reporter=reporter) as servers:
+        servers.start('model', 'a' * 40, 8000, 'decision', .85, 32768)
+    log = (tmp_path / 'run.log').read_text()
+    assert 'Waiting for decision server' in log
+    assert str(tmp_path / 'servers' / 'decision.log') in log
+    assert 'RuntimeError' in log
+    assert not servers.processes
+
+
 @pytest.fixture
 def fake_run(monkeypatch, tmp_path):
     monkeypatch.delenv('DECISION_RAG_GPU_INDEX', raising=False)
@@ -155,6 +191,8 @@ def fake_run(monkeypatch, tmp_path):
     def run(command, **kwargs):
         calls.append(command)
         masks.append(kwargs['env']['CUDA_VISIBLE_DEVICES'])
+        assert kwargs['env']['PYTHONUNBUFFERED'] == '1'
+        assert 'stdout' not in kwargs and 'stderr' not in kwargs  # keep child terminal progress live
     monkeypatch.setattr(runner.subprocess, "run", run)
     class FakeServers:
         def __init__(self, *args):
@@ -208,7 +246,7 @@ def test_ablations_run_only_inference_with_no_pooling_servers(fake_run):
     assert events[-1] == ("close", "decision")
 
 
-def test_benchmark_failure_still_exits_pooling_context(fake_run, monkeypatch):
+def test_benchmark_failure_still_exits_pooling_context(fake_run, monkeypatch, tmp_path):
     _, events, _ = fake_run
     def fail_dense(command, **kwargs):
         if "--method" in command and option(command, "--method") == "dense":
@@ -218,6 +256,28 @@ def test_benchmark_failure_still_exits_pooling_context(fake_run, monkeypatch):
         runner.main(["scifact", "3", "--run-tag", "failure"])
     assert events[-1] == ("close", "embedding")
     assert ("start", "decision") not in events
+    output = tmp_path / 'results' / 'failure' / 'scifact'
+    assert 'CalledProcessError' in (output / 'run.log').read_text()
+    records = [json.loads(line) for line in (output / 'events.jsonl').read_text().splitlines()]
+    assert not any(record['event'] == 'suite_completed' for record in records)
+    assert [record['benchmark'] for record in records if record['event'] == 'benchmark_completed'] == ['bm25']
+
+
+def test_suite_reports_stages_and_forwards_progress_settings(fake_run, tmp_path, capsys):
+    calls, _, _ = fake_run
+    runner.main(['scifact', '3', '--run-tag', 'logging', '--progress', 'off', '--log-interval', '7'])
+    benchmarks = [call for call in calls if 'benchmark' in call]
+    assert all(option(call, '--progress') == 'off' for call in benchmarks)
+    assert all(float(option(call, '--log-interval')) == 7 for call in benchmarks)
+    output = tmp_path / 'results' / 'logging' / 'scifact'
+    records = [json.loads(line) for line in (output / 'events.jsonl').read_text().splitlines()]
+    assert [row['completed'] for row in records if row['event'] == 'benchmark_completed'] == list(range(1, 6))
+    completed = next(row for row in records if row['event'] == 'suite_completed')
+    assert completed['completed'] == completed['total'] == 5
+    assert 'Completed 5/5: naive-choice-vllm' in (output / 'run.log').read_text()
+    captured = capsys.readouterr()
+    assert 'Benchmark 1/5: bm25' in captured.err
+    assert '\r' not in captured.err and '\x1b[' not in captured.err
 
 
 @pytest.mark.parametrize('cli_args,expected', [([], '2'), (['--gpu-index', '3'], '3')])

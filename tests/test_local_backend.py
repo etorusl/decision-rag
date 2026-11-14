@@ -190,7 +190,7 @@ def test_hf_scores_are_order_invariant_and_do_not_generate():
 
 
 @pytest.mark.parametrize("mode", ["head", "lora"])
-def test_tiny_training_and_checkpoint_reload(tmp_path, mode):
+def test_tiny_training_and_checkpoint_reload(tmp_path, mode, capsys):
     if mode == "lora":
         pytest.importorskip("peft")
     torch.manual_seed(1)
@@ -218,6 +218,7 @@ def test_tiny_training_and_checkpoint_reload(tmp_path, mode):
         projection_dim=8,
         lora_rank=2,
         lora_alpha=4,
+        head_only_steps=1,
         max_steps=1,
         gradient_accumulation=2,
         max_context_tokens=1024,
@@ -225,9 +226,27 @@ def test_tiny_training_and_checkpoint_reload(tmp_path, mode):
         warmup_steps=0,
         save_every=0,
         dev_path=train,
+        progress="off",
     )
-    assert summary["trained_steps"] == 1
+    assert summary["trained_steps"] == 2
+    assert summary["optimizer_updates"] == 1
     assert summary["validation"]["questions"] == 4
+    # Diagnostics belong to stderr/files; the training CLI keeps stdout as final JSON.
+    assert capsys.readouterr().out == ""
+    rows = [json.loads(line) for line in (output / "train_log.jsonl").read_text().splitlines()]
+    assert [row["phase"] for row in rows] == ["head_warmup", "train", "validation"]
+    assert [row["step"] for row in rows] == [1, 2, 2]
+    assert all(row["timestamp"] and row["elapsed_seconds"] >= 0 for row in rows)
+    events = [json.loads(line) for line in (output / "events.jsonl").read_text().splitlines()]
+    phases = {event["phase"]: event for event in events if event["event"] == "phase_completed"}
+    assert phases["Check training records"]["completed"] == 2
+    assert phases["Head warmup"]["completed"] == phases["Head warmup"]["total"] == 1
+    assert phases["Train"]["completed"] == phases["Train"]["total"] == 1
+    assert phases["Train"]["metrics"]["processed_records"] == 2
+    assert phases["Validate"]["completed"] == phases["Validate"]["total"] == 2
+    assert phases["Validate"]["metrics"]["accuracy"] == summary["validation"]["accuracy"]
+    assert "Save final checkpoint" in phases
+    assert "training_completed" in (output / "run.log").read_text()
     backend = DecisionHeadBackend(str(output), device="cpu", dtype="float32")
     result = backend.binary(row["context"], row["questions"])
     assert len(result.probabilities) == 2

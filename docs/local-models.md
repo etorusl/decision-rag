@@ -46,6 +46,15 @@ LoRA uses rank 64, alpha 128, no dropout, and all attention and MLP projections.
 
 Checkpoints contain a tokenizer, a safetensors head, a LoRA adapter or full backbone where appropriate, `decision_config.json`, and training logs. Periodic checkpoints use `step-N` directories. Optimizer-state resume is not implemented; use final or periodic inference checkpoints, and start a new training directory for another run. The final validation report contains loss and classification accuracy; retrieval quality must be measured separately with the retrieval evaluator.
 
+Progress bars show separate preparation, head warm-up, optimizer updates and validation stages,
+with elapsed time, rate and ETA where the stage has a known total. Loss and learning rate are
+shown during training. `--progress auto` enables bars in terminals; `on` forces them and `off`
+uses plain log lines. `--log-interval 30` controls periodic progress records, including runs
+under `nohup`. Environment defaults are `DECISION_RAG_PROGRESS` and `DECISION_RAG_LOG_INTERVAL`.
+The output directory contains human-readable `run.log`, structured `events.jsonl`, and detailed
+`train_log.jsonl` metrics. Errors include tracebacks in the logs; progress goes to stderr and
+the final result remains JSON on stdout.
+
 ## Reproduction limits
 
 The paper's main results use hosted Jev 1.13. Its general-trained Qwen decision checkpoint, exact general-training mixture, projection dimension, special-token format, and seeds were not provided with the supplied article. This implementation therefore uses explicit independent choices: 1,024-dimensional projections, existing EOS markers after questions/options, and a documented local training recipe. Starting LoRA from Qwen3-Base plus a freshly initialized head does not reproduce the paper's “general + MD2D + CQA (LoRA)” initialization. The user must measure local results, and paper scores must not be copied into local result tables.

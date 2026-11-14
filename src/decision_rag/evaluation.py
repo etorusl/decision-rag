@@ -8,10 +8,12 @@ import platform
 import subprocess
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 from .backends.base import sum_known
 from .metrics import aggregate, latency_summary, retrieval_metrics
+from .observability import RunReporter
 
 
 def synchronize():
@@ -51,7 +53,21 @@ def file_hash(path):
     return digest.hexdigest()
 
 
-def evaluate(retriever, queries, output_dir, *, warmup=0, config=None, source_paths=(), dedup_text=False, initialization_seconds=None, gpu_monitor_index=None):
+def evaluate(retriever, queries, output_dir, *, warmup=0, config=None, source_paths=(), dedup_text=False,
+             initialization_seconds=None, gpu_monitor_index=None, reporter=None, progress='auto', log_interval=30.0):
+    output = Path(output_dir)
+    if (output / 'queries.jsonl').exists():
+        raise ValueError("Output already contains a run. Choose a new --output directory.")
+    reporting = nullcontext(reporter) if reporter is not None else RunReporter(
+        output, progress=progress, log_interval=log_interval, name='benchmark')
+    with reporting as active_reporter:
+        return _evaluate(retriever, queries, output, warmup=warmup, config=config, source_paths=source_paths,
+                         dedup_text=dedup_text, initialization_seconds=initialization_seconds,
+                         gpu_monitor_index=gpu_monitor_index, reporter=active_reporter)
+
+
+def _evaluate(retriever, queries, output, *, warmup, config, source_paths, dedup_text,
+              initialization_seconds, gpu_monitor_index, reporter):
     if warmup < 0:
         raise ValueError("warmup must be nonnegative")
     ids = [q.id for q in queries]
@@ -64,10 +80,7 @@ def evaluate(retriever, queries, output_dir, *, warmup=0, config=None, source_pa
         unknown = set(query.relevant_ids) - passages
         if unknown:
             raise ValueError(f"Unknown gold passage IDs for {query.id}: {sorted(unknown)[:5]}")
-    output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    if (output / 'queries.jsonl').exists():
-        raise ValueError("Output already contains a run. Choose a new --output directory.")
     # Ensure the chronological stateful protocol is unambiguous.
     last = {}
     for query in queries:
@@ -77,6 +90,8 @@ def evaluate(retriever, queries, output_dir, *, warmup=0, config=None, source_pa
                 raise ValueError(f"Non-increasing turns in conversation {query.conversation_id}")
             last[query.conversation_id] = query.turn_id
     external = bool(getattr(retriever, "external_inference", False))
+    reporter.event('benchmark_start', queries=len(queries), warmup_queries=min(warmup, len(queries)),
+                   external_inference=external, output=str(output))
     def sync():
         if not external:
             synchronize()
@@ -85,12 +100,15 @@ def evaluate(retriever, queries, output_dir, *, warmup=0, config=None, source_pa
             retriever.prepare_query(query)
     retriever.reset()
     sync()
-    warmup_start = time.perf_counter()
-    for query in queries[:warmup]:
-        prepare(query)
-        retriever.retrieve(query)
-    sync()
-    warmup_seconds = time.perf_counter() - warmup_start
+    warmup_seconds = 0.0
+    with reporter.phase('Warmup', total=min(warmup, len(queries)), unit='query') as phase:
+        for query in queries[:warmup]:
+            warmup_start = time.perf_counter()
+            prepare(query)
+            retriever.retrieve(query)
+            sync()
+            warmup_seconds += time.perf_counter() - warmup_start
+            phase.update()
     retriever.reset()  # warmup decisions must never leak into measured conversations
     sync()
     if not external and 'torch' in sys.modules:
@@ -107,11 +125,14 @@ def evaluate(retriever, queries, output_dir, *, warmup=0, config=None, source_pa
                 key = key.lower()
             canonical[p.id] = hashlib.sha256(key.encode()).hexdigest()
     metrics, latencies = [], []
+    total_latency, recall_sum, labeled = 0.0, 0.0, 0
     work = {key: 0 for key in ("input_tokens", "forward_passes", "requests")}
     from .telemetry import GPUMonitor
     monitor = GPUMonitor(gpu_monitor_index)
-    with monitor, (output / 'queries.jsonl').open('w', encoding='utf-8') as stream:
-        for query in queries:
+    with reporter.phase('Benchmark', total=len(queries), unit='query') as phase, \
+            monitor, (output / 'queries.jsonl').open('w', encoding='utf-8') as stream:
+        for query_index, query in enumerate(queries, 1):
+            reporter.event('query_start', console=False, query_index=query_index, query_id=query.id)
             prepare(query)
             sync()
             start = time.perf_counter()
@@ -139,6 +160,16 @@ def evaluate(retriever, queries, output_dir, *, warmup=0, config=None, source_pa
                         work.setdefault(key, 0)
                 for key, value in work.items():
                     work[key] = sum_known([value, stage.get(key, 0)])
+            total_latency += elapsed
+            if measured:
+                labeled += 1
+                recall_sum += measured['recall@10']
+            progress_metrics = {'mean_latency_s': total_latency / query_index, 'labeled_queries': labeled}
+            if labeled:
+                progress_metrics['recall_at_10'] = recall_sum / labeled
+            reporter.event('query_complete', console=False, query_index=query_index, query_id=query.id,
+                           latency_seconds=elapsed, metrics=measured)
+            phase.update(**progress_metrics)
     summary = {"quality": aggregate(metrics), "labeled_queries": sum(bool(m) for m in metrics),
                "unlabeled_queries": sum(not bool(m) for m in metrics),
                "latency": latency_summary(latencies), "warmup_queries": min(warmup, len(queries)),
@@ -158,4 +189,6 @@ def evaluate(retriever, queries, output_dir, *, warmup=0, config=None, source_pa
             summary['gpu_peak_allocated_bytes'] = torch.cuda.max_memory_allocated()
             summary['gpu_peak_reserved_bytes'] = torch.cuda.max_memory_reserved()
     (output / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2) + '\n')
+    reporter.event('benchmark_complete', queries=len(queries), quality=summary['quality'],
+                   latency=summary['latency'], summary_path=str(output / 'summary.json'))
     return summary

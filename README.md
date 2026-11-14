@@ -70,6 +70,12 @@ MTRAG использует официальные gold labels: расширен�
 Каждый запуск пишет `queries.jsonl` и `summary.json`, commit SHA, версии и SHA256 входов.
 Результаты и веса не коммитятся.
 
+Обучение и бенчмарки показывают progress bars с количеством шагов/запросов, скоростью и ETA.
+В каталоге каждого запуска сохраняются `run.log` и `events.jsonl`; обучение также пишет
+`train_log.jsonl`. Без TTY идут обычные строки прогресса. Настройки: `--progress auto|on|off`
+и `--log-interval 30`; для shell-скриптов доступны `DECISION_RAG_PROGRESS` и
+`DECISION_RAG_LOG_INTERVAL`. Примеры, включая `nohup`: [логи vLLM](docs/vllm.md#прогресс-и-логи).
+
 ```bash
 # Таблица по завершённым запускам
 python scripts/summarize_runs.py results

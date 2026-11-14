@@ -3,6 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/gpu_env.sh
+export PYTHONUNBUFFERED=1
 source .venv/bin/activate
 dataset="${1:-multidoc2dial}"
 mode="${2:-smoke}"

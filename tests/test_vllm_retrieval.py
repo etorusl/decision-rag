@@ -87,6 +87,25 @@ def test_cache_requires_revision_and_rejects_changed_identity(tmp_path):
         VLLMDenseRetriever(different, index_dir=tmp_path, revision=REVISION, client=client)
 
 
+def test_index_progress_counts_actual_passages_and_reports_cache_reuse(tmp_path):
+    from decision_rag.observability import RunReporter
+
+    calls = []
+    client = pooling_client(EMBED_MODEL, lambda request: embeddings_reply(request, calls))
+    with RunReporter(tmp_path / 'logs', progress='off') as reporter:
+        first = VLLMDenseRetriever(corpus(), index_dir=tmp_path / 'index', revision=REVISION,
+                                   client=client, batch_size=2, reporter=reporter)
+        second = VLLMDenseRetriever(corpus(), index_dir=tmp_path / 'index', revision=REVISION,
+                                    client=client, reporter=reporter)
+    assert len(calls) == 2
+    np.testing.assert_allclose(first.embeddings, second.embeddings)
+    events = [json.loads(line) for line in (tmp_path / 'logs' / 'events.jsonl').read_text().splitlines()]
+    built = next(row for row in events if row['event'] == 'phase_completed')
+    assert built['completed'] == built['total'] == 3
+    assert built['metrics']['batches'] == 2
+    assert any(row['event'] == 'index_cache_loaded' for row in events)
+
+
 @pytest.mark.parametrize("failure", ["indices", "nan", "zero", "dimensions", "model"])
 def test_embedding_responses_fail_closed(failure):
     def bad(request):

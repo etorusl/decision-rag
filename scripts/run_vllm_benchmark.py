@@ -10,10 +10,13 @@ import socket
 import subprocess
 import sys
 import time
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
+
+from decision_rag.observability import RunReporter, add_logging_args
 
 ROOT = Path(__file__).resolve().parents[1]
 RERANK_OVERRIDES = {
@@ -41,10 +44,11 @@ def server_command(executable, model, revision, port, kind, memory, max_model_le
 
 
 class Servers:
-    def __init__(self, log_dir, executable, startup_timeout=1200, gpu_index='1'):
+    def __init__(self, log_dir, executable, startup_timeout=1200, gpu_index='1', reporter=None):
         self.log_dir, self.executable = Path(log_dir), executable
         self.startup_timeout = startup_timeout
         self.gpu_index = gpu_index
+        self.reporter = reporter
         self.processes = []
 
     def start(self, model, revision, port, kind, memory, max_model_len):
@@ -55,7 +59,8 @@ class Servers:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         (self.log_dir / f'{kind}-command.json').write_text(json.dumps(command, indent=2) + '\n')
         log = (self.log_dir / f'{kind}.log').open('w')
-        env = {**os.environ, 'VLLM_USE_V1': '1', 'CUDA_VISIBLE_DEVICES': self.gpu_index}
+        env = {**os.environ, 'VLLM_USE_V1': '1', 'CUDA_VISIBLE_DEVICES': self.gpu_index,
+               'PYTHONUNBUFFERED': '1'}
         try:
             process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env,
                                        start_new_session=True)
@@ -65,7 +70,9 @@ class Servers:
         self.processes.append((process, log))
         endpoint = f'http://127.0.0.1:{port}'
         deadline = time.monotonic() + self.startup_timeout
-        with httpx.Client(timeout=5, trust_env=False) as client:
+        phase = self.reporter.phase(f'Waiting for {kind} server', server=kind, model=model,
+                                    log_path=str(log.name), gpu_index=self.gpu_index) if self.reporter else nullcontext()
+        with phase as progress, httpx.Client(timeout=5, trust_env=False) as client:
             while time.monotonic() < deadline:
                 if process.poll() is not None:
                     raise RuntimeError(f'{kind} server exited ({process.returncode}); inspect {log.name}')
@@ -74,13 +81,20 @@ class Servers:
                     if response.status_code == 200 and any(
                         item.get('id') == model for item in response.json().get('data', [])
                     ):
+                        if self.reporter:
+                            self.reporter.event('server_ready', f'{kind} server ready at {endpoint}',
+                                                server=kind, endpoint=endpoint, pid=process.pid,
+                                                log_path=str(log.name))
                         return endpoint
                 except (httpx.HTTPError, ValueError):
                     pass
+                if progress is not None:
+                    progress.update(0, server=kind)
                 time.sleep(1)
-        raise TimeoutError(f'{kind} startup timed out; inspect {log.name}')
+            raise TimeoutError(f'{kind} startup timed out; inspect {log.name}')
 
     def close(self):
+        stopped = []
         for process, log in reversed(self.processes):
             try:
                 # Only terminate process groups started by this orchestrator.
@@ -96,7 +110,14 @@ class Servers:
                     pass
                 process.wait(timeout=10)
             log.close()
+            if self.reporter:
+                stopped.append((process.pid, str(log.name)))
         self.processes.clear()
+        # A full/unavailable log filesystem must not leave another owned server running.
+        if self.reporter:
+            for pid, log_path in stopped:
+                self.reporter.event('server_stopped', 'Stopped owned vLLM server',
+                                    pid=pid, log_path=log_path)
 
     def __enter__(self):
         return self
@@ -123,6 +144,7 @@ def main(argv=None):
     parser.add_argument('--gpu-index', default=os.getenv('DECISION_RAG_GPU_INDEX') or '1',
                         help='Single GPU index for CUDA_VISIBLE_DEVICES and nvidia-smi monitoring (default: 1)')
     parser.add_argument('--startup-timeout', type=float, default=1200)
+    add_logging_args(parser)
     args = parser.parse_args(argv)
     if not args.gpu_index.isascii() or not args.gpu_index.isdecimal():
         parser.error('--gpu-index must be one nonnegative GPU index')
@@ -141,25 +163,50 @@ def main(argv=None):
     if run_dir.exists():
         raise ValueError(f'Run directory already exists: {run_dir}')
     run_dir.mkdir(parents=True)
+    with RunReporter(run_dir, progress=args.progress, log_interval=args.log_interval,
+                     name='benchmark-suite') as reporter:
+        reporter.event('suite_started', f'Benchmark suite: {args.dataset}; logs: {run_dir}',
+                       dataset=args.dataset, limit=args.limit, gpu_index=args.gpu_index,
+                       benchmarks=7 if args.ablations else 5, output=str(run_dir))
+        run_suite(args, executable, run_dir, reporter)
+    print(f'Results: {run_dir}')
+
+
+def run_suite(args, executable, run_dir, reporter):
     from huggingface_hub import HfApi
     api = HfApi()
     models = [args.naive_model] if args.ablations else [args.naive_model, args.embedding_model, args.reranker_model]
-    revisions = {model: api.model_info(model).sha for model in dict.fromkeys(models)}
+    revisions = {}
+    with reporter.phase('Resolving model revisions', total=len(set(models)), unit='model') as progress:
+        for model in dict.fromkeys(models):
+            revisions[model] = api.model_info(model).sha
+            progress.update(1, model=model)
     (run_dir / 'server-config.json').write_text(json.dumps({**vars(args), 'revisions': revisions}, indent=2) + '\n')
     cli = [sys.executable, '-m', 'decision_rag']
     def run(*command):
         subprocess.run([str(x) for x in command], check=True,
-                       env={**os.environ, 'CUDA_VISIBLE_DEVICES': args.gpu_index})
-    run(*cli, 'prepare', args.dataset, '--output', f'data/{args.dataset}')
+                       env={**os.environ, 'CUDA_VISIBLE_DEVICES': args.gpu_index, 'PYTHONUNBUFFERED': '1'})
+    with reporter.phase(f'Preparing {args.dataset}'):
+        run(*cli, 'prepare', args.dataset, '--output', f'data/{args.dataset}')
     common = ['--corpus', f'data/{args.dataset}/corpus.jsonl', '--queries', f'data/{args.dataset}/queries.jsonl',
-              '--top-k', '20', '--warmup', '2', '--gpu-monitor-index', args.gpu_index]
+              '--top-k', '20', '--warmup', '2', '--gpu-monitor-index', args.gpu_index,
+              '--progress', args.progress, '--log-interval', str(args.log_interval)]
     if args.limit != 'all':
         common += ['--limit', args.limit]
+    completed, total = 0, 7 if args.ablations else 5
     def benchmark(name, extra):
+        nonlocal completed
+        reporter.event('benchmark_started', f'Benchmark {completed + 1}/{total}: {name}',
+                       benchmark=name, completed=completed, total=total, output=str(run_dir / name))
+        started = time.monotonic()
         run(*cli, 'benchmark', *common, *extra, '--output', run_dir / name)
+        completed += 1
+        reporter.event('benchmark_completed', f'Completed {completed}/{total}: {name}',
+                       benchmark=name, completed=completed, total=total,
+                       benchmark_seconds=time.monotonic() - started)
     if not args.ablations:
         benchmark('bm25', ['--method', 'bm25'])
-        with Servers(run_dir / 'servers', executable, args.startup_timeout, args.gpu_index) as servers:
+        with Servers(run_dir / 'servers', executable, args.startup_timeout, args.gpu_index, reporter) as servers:
             embedding_url = servers.start(args.embedding_model, revisions[args.embedding_model], args.port_base + 1,
                                           'embedding', args.pool_memory, args.pool_max_model_len)
             dense = ['--engine', 'vllm', '--model', args.embedding_model, '--embedding-url', embedding_url,
@@ -171,7 +218,7 @@ def main(argv=None):
             benchmark('dense-rerank-vllm', ['--method', 'dense-rerank', *dense,
                       '--reranker-model', args.reranker_model, '--reranker-url', reranker_url,
                       '--reranker-revision', revisions[args.reranker_model]])
-    with Servers(run_dir / 'servers', executable, args.startup_timeout, args.gpu_index) as servers:
+    with Servers(run_dir / 'servers', executable, args.startup_timeout, args.gpu_index, reporter) as servers:
         decision_url = servers.start(args.naive_model, revisions[args.naive_model], args.port_base,
                                      'decision', args.decision_memory, args.max_model_len)
         naive = ['--backend', 'vllm', '--model', args.naive_model, '--model-revision', revisions[args.naive_model],
@@ -187,8 +234,10 @@ def main(argv=None):
         else:
             benchmark('naive-binary-vllm', [*naive, '--choice-k', '0'])
             benchmark('naive-choice-vllm', [*naive, '--choice-k', '20'])
-    run(sys.executable, 'scripts/summarize_runs.py', run_dir, '--output', run_dir / 'comparison')
-    print(f'Results: {run_dir}')
+    with reporter.phase('Summarizing benchmark results'):
+        run(sys.executable, 'scripts/summarize_runs.py', run_dir, '--output', run_dir / 'comparison')
+    reporter.event('suite_completed', f'Benchmark suite completed; results: {run_dir}',
+                   completed=completed, total=total, output=str(run_dir))
 
 
 if __name__ == '__main__':

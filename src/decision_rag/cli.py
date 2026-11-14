@@ -7,6 +7,7 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
+from .observability import RunReporter, add_logging_args
 from .retrieval import DecisionRetriever, RetrievalConfig
 from .schema import Corpus, load_queries, read_jsonl
 
@@ -48,6 +49,87 @@ def model_args(p):
     p.add_argument('--max-context-tokens', type=int, default=32768)
     p.add_argument('--max-packed-tokens', type=int, default=40960)
     p.add_argument('--provider', default='typesafe', choices=['typesafe','openrouter'])
+
+
+def _benchmark(args, reporter):
+    from .evaluation import evaluate
+    initialization_start = time.perf_counter()
+    with reporter.phase('Load corpus and queries', total=2, unit='file') as phase:
+        corpus = Corpus.load(args.corpus)
+        phase.update()
+        queries = load_queries(args.queries)
+        if args.limit is not None:
+            if args.limit <= 0:
+                raise ValueError('--limit must be positive')
+            queries = queries[:args.limit]
+        if not queries:
+            raise ValueError('No evaluation queries')
+        phase.update(queries=len(queries), passages=len(corpus.passages))
+    with reporter.phase('Initialize model and index', total=1, unit='stage', method=args.method) as phase:
+        if args.method == 'decision':
+            if args.config:
+                cfg = RetrievalConfig(**json.loads(Path(args.config).read_text()))
+            else:
+                changes = {'top_k': args.top_k, 'choice_k': args.choice_k,
+                               'max_request_tokens': args.max_request_tokens or (20000 if args.preset == 'nq' else 30000), 'max_candidates': args.max_candidates,
+                               'concurrency': args.concurrency, 'use_memory': not args.no_memory,
+                               'shared_context': not args.independent}
+                if args.pages:
+                    changes['page_budget'] = args.pages
+                    changes['budgets'] = [args.pages]
+                cfg = RetrievalConfig.for_dataset(args.preset, **changes)
+            backend = backend_from_args(args)
+            retriever = DecisionRetriever(corpus, backend, cfg)
+            model = getattr(backend, 'model', None)
+            model = getattr(model, 'backbone', model)
+            revision = getattr(getattr(model, 'config', None), '_commit_hash', None)
+            config = {'method': args.method, 'backend': backend.name, 'retrieval': asdict(cfg),
+                      'model_revision': revision, 'args': vars(args),
+                      'runtime': getattr(backend, 'runtime_metadata', {})}
+        elif args.method == 'bm25':
+            from .baselines import BM25Retriever
+            retriever = BM25Retriever(corpus, args.top_k)
+            config = vars(args)
+        elif args.engine == 'vllm':
+            from .vllm_retrieval import VLLMDenseRerankRetriever, VLLMDenseRetriever
+            if args.method == 'dense':
+                retriever = VLLMDenseRetriever(
+                    corpus, model_name=args.model or 'Qwen/Qwen3-Embedding-8B',
+                    base_url=args.embedding_url, top_k=args.top_k, batch_size=args.batch_size,
+                    index_dir=args.index_dir, revision=args.embedding_revision, timeout=args.http_timeout,
+                    dtype=args.dtype, reporter=reporter)
+            else:
+                retriever = VLLMDenseRerankRetriever(
+                    corpus, embedding_model=args.model or 'Qwen/Qwen3-Embedding-8B',
+                    reranker_model=args.reranker_model, embedding_base_url=args.embedding_url,
+                    reranker_base_url=args.reranker_url, top_k=args.top_k, candidates=args.rerank_candidates,
+                    batch_size=args.batch_size, index_dir=args.index_dir,
+                    embedding_revision=args.embedding_revision, reranker_revision=args.reranker_revision,
+                    timeout=args.http_timeout, dtype=args.dtype, reporter=reporter)
+            config = {**vars(args), 'runtime': retriever.runtime_metadata}
+        elif args.method == 'dense-rerank':
+            from .reranking import DenseRerankRetriever
+            retriever = DenseRerankRetriever(
+                corpus, embedding_model=args.model or 'Qwen/Qwen3-Embedding-8B',
+                reranker_model=args.reranker_model, top_k=args.top_k, candidates=args.rerank_candidates,
+                device=args.device, batch_size=args.batch_size, index_dir=args.index_dir,
+                dtype=args.dtype, max_length=args.rerank_max_length)
+            config = vars(args)
+        else:
+            from .baselines import DenseRetriever
+            retriever = DenseRetriever(corpus, args.model or 'Qwen/Qwen3-Embedding-0.6B', args.top_k,
+                                       args.device, args.batch_size, args.index_dir, dtype=args.dtype)
+            config = vars(args)
+        phase.update()
+    try:
+        result = evaluate(retriever, queries, args.output, warmup=args.warmup,
+                          config=config, source_paths=[args.corpus,args.queries], dedup_text=args.dedup_text,
+                          initialization_seconds=time.perf_counter() - initialization_start,
+                          gpu_monitor_index=args.gpu_monitor_index, reporter=reporter)
+    finally:
+        if hasattr(retriever, "close"):
+            retriever.close()
+    return result
 
 
 def main(argv=None):
@@ -97,6 +179,7 @@ def main(argv=None):
     bench.add_argument('--rerank-candidates', type=int, default=100)
     bench.add_argument('--rerank-max-length', type=int, default=8192)
     model_args(bench)
+    add_logging_args(bench)
     records = subs.add_parser('training-data', help='Generate local supervision from training-only queries')
     records.add_argument('--corpus', required=True)
     records.add_argument('--queries', required=True)
@@ -139,77 +222,11 @@ def main(argv=None):
                                     max_queries=args.limit,
                                     monitor_fraction=.1 if args.dataset == 'conditionalqa' else .03)
     else:
-        from .evaluation import evaluate
-        initialization_start = time.perf_counter()
-        corpus = Corpus.load(args.corpus)
-        queries = load_queries(args.queries)
-        if args.limit is not None:
-            if args.limit <= 0:
-                raise ValueError('--limit must be positive')
-            queries = queries[:args.limit]
-        if not queries:
-            raise ValueError('No evaluation queries')
-        if args.method == 'decision':
-            if args.config:
-                cfg = RetrievalConfig(**json.loads(Path(args.config).read_text()))
-            else:
-                changes = {'top_k': args.top_k, 'choice_k': args.choice_k,
-                               'max_request_tokens': args.max_request_tokens or (20000 if args.preset == 'nq' else 30000), 'max_candidates': args.max_candidates,
-                               'concurrency': args.concurrency, 'use_memory': not args.no_memory,
-                               'shared_context': not args.independent}
-                if args.pages:
-                    changes['page_budget'] = args.pages
-                    changes['budgets'] = [args.pages]
-                cfg = RetrievalConfig.for_dataset(args.preset, **changes)
-            backend = backend_from_args(args)
-            retriever = DecisionRetriever(corpus, backend, cfg)
-            model = getattr(backend, 'model', None)
-            model = getattr(model, 'backbone', model)
-            revision = getattr(getattr(model, 'config', None), '_commit_hash', None)
-            config = {'method': args.method, 'backend': backend.name, 'retrieval': asdict(cfg),
-                      'model_revision': revision, 'args': vars(args),
-                      'runtime': getattr(backend, 'runtime_metadata', {})}
-        elif args.method == 'bm25':
-            from .baselines import BM25Retriever
-            retriever = BM25Retriever(corpus, args.top_k)
-            config = vars(args)
-        elif args.engine == 'vllm':
-            from .vllm_retrieval import VLLMDenseRerankRetriever, VLLMDenseRetriever
-            if args.method == 'dense':
-                retriever = VLLMDenseRetriever(
-                    corpus, model_name=args.model or 'Qwen/Qwen3-Embedding-8B',
-                    base_url=args.embedding_url, top_k=args.top_k, batch_size=args.batch_size,
-                    index_dir=args.index_dir, revision=args.embedding_revision, timeout=args.http_timeout, dtype=args.dtype)
-            else:
-                retriever = VLLMDenseRerankRetriever(
-                    corpus, embedding_model=args.model or 'Qwen/Qwen3-Embedding-8B',
-                    reranker_model=args.reranker_model, embedding_base_url=args.embedding_url,
-                    reranker_base_url=args.reranker_url, top_k=args.top_k, candidates=args.rerank_candidates,
-                    batch_size=args.batch_size, index_dir=args.index_dir,
-                    embedding_revision=args.embedding_revision, reranker_revision=args.reranker_revision,
-                    timeout=args.http_timeout, dtype=args.dtype)
-            config = {**vars(args), 'runtime': retriever.runtime_metadata}
-        elif args.method == 'dense-rerank':
-            from .reranking import DenseRerankRetriever
-            retriever = DenseRerankRetriever(
-                corpus, embedding_model=args.model or 'Qwen/Qwen3-Embedding-8B',
-                reranker_model=args.reranker_model, top_k=args.top_k, candidates=args.rerank_candidates,
-                device=args.device, batch_size=args.batch_size, index_dir=args.index_dir,
-                dtype=args.dtype, max_length=args.rerank_max_length)
-            config = vars(args)
-        else:
-            from .baselines import DenseRetriever
-            retriever = DenseRetriever(corpus, args.model or 'Qwen/Qwen3-Embedding-0.6B', args.top_k,
-                                       args.device, args.batch_size, args.index_dir, dtype=args.dtype)
-            config = vars(args)
-        try:
-            result = evaluate(retriever, queries, args.output, warmup=args.warmup,
-                              config=config, source_paths=[args.corpus,args.queries], dedup_text=args.dedup_text,
-                              initialization_seconds=time.perf_counter() - initialization_start,
-                              gpu_monitor_index=args.gpu_monitor_index)
-        finally:
-            if hasattr(retriever, "close"):
-                retriever.close()
+        output = Path(args.output)
+        if (output / 'queries.jsonl').exists():
+            raise ValueError('Output already contains a run. Choose a new --output directory.')
+        with RunReporter(output, progress=args.progress, log_interval=args.log_interval, name='benchmark') as reporter:
+            result = _benchmark(args, reporter)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
