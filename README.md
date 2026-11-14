@@ -41,6 +41,10 @@ bash scripts/benchmark_h100.sh conditionalqa all
 
 Сначала запускайте короткую выборку. Скрипт сам поднимает и останавливает локальные vLLM-серверы;
 для готовых моделей training-этапа нет. Установка vLLM изолирована в `.venv-vllm`.
+Dense-поиск и top-k по умолчанию выполняются на GPU вместе с embedding/reranker;
+FP32-индекс переносится туда один раз при инициализации. Устройство поиска и время
+query embedding / vector search записываются в результаты; CPU-поиск требует явного `--search-device cpu`.
+BM25 scoring и top-k также используют GPU; текстовая подготовка и токенизация выполняются на CPU.
 Для другой GPU задайте `DECISION_RAG_GPU_INDEX=N`; в benchmark runner также доступен `--gpu-index N`.
 H100 memory/latency и качество больших моделей **ещё не измерены** на машине разработки.
 Подробные команды, параметры и обработка OOM: [инструкция vLLM](docs/vllm.md).

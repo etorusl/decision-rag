@@ -27,8 +27,8 @@ bash scripts/benchmark_h100.sh multidoc2dial 100
 
 1. Подготавливает полный корпус и выбранное число evaluation queries.
 2. Фиксирует Hugging Face revision SHA для каждой модели и запускает сервер с этим SHA.
-3. Измеряет BM25 на CPU.
-4. Запускает embedding server на `127.0.0.1:8001` с бюджетом 40% VRAM; измеряет dense.
+3. Измеряет BM25: численный scoring и top-k выполняются на GPU.
+4. Запускает embedding server на `127.0.0.1:8001` с бюджетом 40% VRAM; измеряет dense с поиском на GPU.
 5. Запускает reranker server на `127.0.0.1:8002` с ещё 40%; измеряет live dense → reranker.
 6. Останавливает оба своих сервера и запускает Qwen3 на `127.0.0.1:8000` с 85% VRAM.
 7. Измеряет DecisionRAG без обучения, с binary scoring и с дополнительным choice reranking.
@@ -93,6 +93,20 @@ Backend проверяет served model и tokenizer, считывает обе 
 Точная схема single-token scoring: [decision backend](vllm-backend.md).
 `decision-rag benchmark --method dense` и `--method dense-rerank` по умолчанию также используют
 vLLM (`--engine vllm`). Прежняя реализация доступна явно через `--engine hf` / `--backend hf`.
+В обоих dense-бэкендах точный поиск и top-k по умолчанию выполняются на GPU
+(`--search-device cuda`). FP32-индекс загружается в GPU один раз при инициализации;
+при каждом запросе переносится его вектор, обратно возвращаются только top-k IDs/scores.
+Это та же физическая GPU 1, которую используют модели. TF32 отключён для поиска,
+embedding/reranker продолжают работать в BF16. CPU-поиск доступен явно через
+`--search-device cpu` и записывается в конфиг как отдельный эксперимент.
+Этот же параметр управляет численным BM25 scoring и top-k; подготовка текста и токенизация
+остаются на CPU.
+
+Размер матрицы индекса — `passages × embedding_dimension × 4` байта плюс CUDA context
+и рабочая память поиска. При двух pooling-серверах с бюджетами 40% + 40% индекс занимает
+часть оставшейся памяти. При OOM запуск завершится с ошибкой; скрытого перехода на CPU нет.
+При необходимости уменьшайте `--pool-memory` с учётом памяти моделей. Результаты старой
+версии с CPU-поиском следует перезапустить для сравнения времени с GPU DecisionRAG.
 
 ## Что именно измеряется
 
@@ -108,17 +122,22 @@ vLLM (`--engine vllm`). Прежняя реализация доступна я�
   разрешает межзапросный reuse и является отдельным экспериментом.
 - **Embedding/reranker:** pooling servers запускаются с `--no-enable-prefix-caching`, поэтому
   повтор первого query после warmup не получает скрытого ускорения.
+  В dense-stage отдельно записываются `query_embedding_seconds` и `vector_search_seconds`;
+  второй включает перенос вектора запроса на GPU и получение готового top-k. Время reranking
+  записывается отдельным этапом. Построение и перенос индекса относятся к инициализации.
 - **Work:** logical input tokens, cached tokens (если сервер сообщает), completion tokens,
   HTTP requests и model sequences. Количество внутренних GPU forward passes неизвестно и
   сохраняется как `null`, а не выдумывается из количества запросов.
 - **Память:** `nvidia-smi` опрашивается каждые 250 ms. Это sampled device memory целого GPU,
-  включая все процессы и KV reservation. Не `torch.cuda.max_memory_allocated` клиентского процесса.
+  включая индекс в клиенте, все процессы vLLM и KV reservation. Не `torch.cuda.max_memory_allocated` клиентского процесса.
   Короткие пики между samples могут быть пропущены. `--gpu-monitor-index` задаёт физический
   индекс для уже запущенного сервера. В runner `--gpu-index` одновременно выбирает
   физическую GPU для серверов через `CUDA_VISIBLE_DEVICES` и для мониторинга; default — `1`.
 
 Сохраняются timings, запросы, параметры, версии, hashes, server logs и model revisions.
 Сравнивайте одни и те же corpus/query SHA и precision. Для повторов задавайте разные `RUN_TAG`.
+CSV/Markdown-сводка отдельно показывает устройство и точность поиска, размер индекса,
+среднее время query embedding / vector search и sampled пиковую память всей GPU.
 
 ## Прогресс и логи
 

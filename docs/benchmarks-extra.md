@@ -30,11 +30,11 @@ python -m decision_rag.stress --output data/stress-1000 \
   --pages 1000 --passages-per-page 10 --words-per-passage 100 \
   --queries 100 --seed 42 --branching 100
 
-# Local CPU baseline and GPU traversal, timed with the same query stream:
-decision-rag benchmark --method bm25 --corpus data/stress-1000/corpus.jsonl \
+# GPU BM25 and GPU traversal, timed with the same query stream:
+CUDA_VISIBLE_DEVICES=1 decision-rag benchmark --method bm25 --corpus data/stress-1000/corpus.jsonl \
   --queries data/stress-1000/queries.jsonl --output results/stress-1000-bm25
 
-decision-rag benchmark --method decision --backend hf --model Qwen/Qwen3-8B \
+CUDA_VISIBLE_DEVICES=1 decision-rag benchmark --method decision --backend hf --model Qwen/Qwen3-8B \
   --preset generic --pages 10 --max-request-tokens 8192 \
   --corpus data/stress-1000/corpus.jsonl --queries data/stress-1000/queries.jsonl \
   --output results/stress-1000-hf

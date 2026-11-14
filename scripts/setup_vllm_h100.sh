@@ -18,5 +18,6 @@ assert torch.cuda.is_available(), 'CUDA GPU is required for the local vLLM serve
 print({'vllm': vllm.__version__, 'torch': torch.__version__, 'cuda': torch.version.cuda,
        'gpu': torch.cuda.get_device_name(0), 'cuda_visible_devices': os.environ['CUDA_VISIBLE_DEVICES']})
 PY
+python -m pytest -q tests/test_dense_search.py tests/test_baselines.py tests/test_vllm_retrieval.py
 python -m pip freeze > environment-vllm-h100.txt
 printf '%s\n' 'Ready: bash scripts/benchmark_h100.sh multidoc2dial 100'

@@ -1,4 +1,4 @@
-"""CPU BM25 and optional exact dense retrieval, sharing evaluation and corpus IDs."""
+"""GPU-first BM25 and exact dense retrieval, sharing evaluation and corpus IDs."""
 from __future__ import annotations
 
 import math
@@ -8,6 +8,7 @@ from collections import Counter, defaultdict
 
 import numpy as np
 
+from .dense_search import ExactDenseIndex, resolve_search_device, stable_numpy_top_k, stable_torch_top_k
 from .retrieval import RetrievalResult
 
 
@@ -16,7 +17,11 @@ def tokenize(text):
 
 
 class BM25Retriever:
-    def __init__(self, corpus, top_k=20, k1=1.2, b=0.75):
+    def __init__(self, corpus, top_k=20, k1=1.2, b=0.75, *, device='cuda'):
+        if top_k <= 0 or not corpus.passages:
+            raise ValueError('BM25 requires passages and positive top_k')
+        self.local_search_device = resolve_search_device(device)
+        self._closed = False
         self.corpus, self.top_k, self.k1, self.b = corpus, top_k, k1, b
         self.passages = corpus.passages
         self.postings = defaultdict(list)
@@ -41,34 +46,99 @@ class BM25Retriever:
             idf = math.log(1 + (n - len(rows) + .5) / (len(rows) + .5))
             self.weights[token] = (indices, idf * frequencies * (self.k1 + 1) / (frequencies + norm[indices]))
         del self.postings
+        self._ids = self._weights = None
+        self.offsets = {}
+        index_bytes = sum(ids.nbytes + values.nbytes for ids, values in self.weights.values())
+        transfer_seconds = 0.0
+        if self.local_search_device != 'cpu':
+            import torch
+            offset = 0
+            for term, (ids, values) in self.weights.items():
+                self.offsets[term] = (offset, offset + len(ids))
+                offset += len(ids)
+            ids = np.concatenate([ids for ids, _ in self.weights.values()]) if self.weights else np.empty(0)
+            values = np.concatenate([values for _, values in self.weights.values()]) if self.weights else np.empty(0)
+            transfer_start = time.perf_counter()
+            try:
+                self._ids = torch.tensor(ids, dtype=torch.int64, device=self.local_search_device)
+                self._weights = torch.tensor(values, dtype=torch.float32, device=self.local_search_device)
+                torch.cuda.synchronize(self.local_search_device)
+            except torch.cuda.OutOfMemoryError as exc:
+                self._ids = self._weights = None
+                raise RuntimeError('BM25 index does not fit on the selected GPU; free GPU memory before retrying') from exc
+            index_bytes = self._ids.numel() * self._ids.element_size() + self._weights.numel() * self._weights.element_size()
+            transfer_seconds = time.perf_counter() - transfer_start
+            self.weights.clear()
+        self.runtime_metadata = {
+            'engine': 'bm25',
+            'search_runtime': {'device': self.local_search_device, 'algorithm': 'precomputed BM25 postings',
+                               'precision': 'float64' if self.local_search_device == 'cpu' else 'float32',
+                               'backend': 'numpy' if self.local_search_device == 'cpu' else 'torch',
+                               'index_bytes': index_bytes, 'index_transfer_seconds': transfer_seconds},
+        }
 
     def reset(self):
         pass
 
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._ids = self._weights = None
+        self.weights.clear()
+        self.offsets.clear()
+        if self.local_search_device != 'cpu':
+            import torch
+            with torch.cuda.device(self.local_search_device):
+                torch.cuda.empty_cache()
+
     def retrieve(self, query):
+        if self._closed:
+            raise RuntimeError('BM25 index is closed')
         start = time.perf_counter()
         n = len(self.passages)
-        scores = np.zeros(n)
-        for token in set(tokenize(query.context())):
-            posting = self.weights.get(token)
-            if posting is not None:
-                ids, weights = posting
-                scores[ids] += weights
-        indices = np.argsort(-scores, kind="stable")[:self.top_k]
+        tokens = sorted(set(tokenize(query.context())))
+        if self.local_search_device == 'cpu':
+            scores = np.zeros(n)
+            for token in tokens:
+                posting = self.weights.get(token)
+                if posting is not None:
+                    ids, weights = posting
+                    scores[ids] += weights
+            indices = stable_numpy_top_k(scores, self.top_k)
+            selected_scores = scores[indices].tolist()
+        else:
+            import torch
+            with torch.inference_mode():
+                scores = torch.zeros(n, device=self.local_search_device, dtype=torch.float32)
+                for token in tokens:
+                    bounds = self.offsets.get(token)
+                    if bounds:
+                        begin, end = bounds
+                        scores.index_add_(0, self._ids[begin:end], self._weights[begin:end])
+                ranking = stable_torch_top_k(scores, self.top_k)
+                indices = ranking.cpu().numpy()
+                selected_scores = scores[ranking].cpu().tolist()
+        elapsed = time.perf_counter() - start
         return RetrievalResult(query.id, [self.passages[i].id for i in indices],
-                               scores[indices].tolist(), time.perf_counter() - start, [])
+                               selected_scores, elapsed,
+                               [{'stage': 'bm25', 'seconds': elapsed, 'candidates': n,
+                                 'search_device': self.local_search_device}])
 
 
 class DenseRetriever:
     def __init__(self, corpus, model_name="Qwen/Qwen3-Embedding-0.6B", top_k=20,
-                 device="cuda", batch_size=16, index_dir=None, dtype="bfloat16"):
+                 device="cuda", batch_size=16, index_dir=None, dtype="bfloat16", *, search_device="cuda"):
         import hashlib
         import json
         from pathlib import Path
 
         from sentence_transformers import SentenceTransformer
+        if min(top_k, batch_size) <= 0 or not corpus.passages:
+            raise ValueError('Dense retrieval requires passages and positive top_k/batch_size')
+        self.local_search_device = resolve_search_device(search_device)
         self.corpus, self.top_k, self.passages = corpus, top_k, corpus.passages
-        self.model_name = model_name
+        self.model_name, self.device = model_name, device
         import torch
 
         from .backends.decision_head import resolve_dtype
@@ -95,7 +165,9 @@ class DenseRetriever:
                 actual = json.loads(meta.read_text())
                 if actual != expected_meta:
                     raise ValueError("Dense index model/corpus mismatch; use a new index directory")
-                self.embeddings = np.load(index_dir / 'embeddings.npy', mmap_mode='r')
+                self.embeddings = np.load(index_dir / 'embeddings.npy', mmap_mode='r', allow_pickle=False)
+                if self.embeddings.ndim != 2 or len(self.embeddings) != len(self.passages):
+                    raise ValueError('Dense cached index shape does not match corpus')
         if self.embeddings is None:
             texts = [p.text for p in self.passages]
             if "e5" in model_name.lower():
@@ -105,13 +177,34 @@ class DenseRetriever:
             if index_dir:
                 np.save(index_dir / 'embeddings.npy', self.embeddings)
                 meta.write_text(json.dumps(expected_meta))
+        try:
+            self.search_index = ExactDenseIndex(self.embeddings, device=self.local_search_device)
+        except BaseException:
+            self.model = None
+            raise
+        self.runtime_metadata = {
+            'engine': 'sentence-transformers', 'embedding_model': self.model_name,
+            'embedding_revision': self.revision, 'embedding_dtype': self.dtype,
+            'embedding_device': str(getattr(self.model, 'device', self.device)),
+            'search_runtime': self.search_index.metadata,
+        }
 
     def reset(self):
         pass
 
+    def close(self):
+        self.model = None
+        self.search_index.close()
+
+    def _synchronize_embedding(self):
+        import torch
+
+        device = getattr(self.model, 'device', self.device)
+        if str(device).startswith('cuda') and torch.cuda.is_available():
+            torch.cuda.synchronize(device)
+
     def retrieve(self, query):
-        from .evaluation import synchronize
-        synchronize()
+        self._synchronize_embedding()
         start = time.perf_counter()
         text = query.context()
         kwargs = {}
@@ -119,10 +212,20 @@ class DenseRetriever:
             kwargs['prompt'] = "Instruct: Given a question, retrieve passages that answer it\nQuery: "
         elif "e5" in self.model_name.lower():
             text = "query: " + text
-        vector = self.model.encode([text], normalize_embeddings=True, convert_to_numpy=True, **kwargs)[0]
-        # CPU exact search is included in timings; no unmeasured saved candidates.
-        scores = self.embeddings @ vector
-        indices = np.argsort(-scores, kind="stable")[:self.top_k]
-        synchronize()
-        return RetrievalResult(query.id, [self.passages[i].id for i in indices], scores[indices].tolist(),
-                               time.perf_counter() - start, [])
+        gpu_search = self.local_search_device != 'cpu'
+        vector = self.model.encode([text], normalize_embeddings=True, convert_to_numpy=not gpu_search,
+                                   convert_to_tensor=gpu_search, **kwargs)[0]
+        self._synchronize_embedding()
+        embedding_seconds = time.perf_counter() - start
+        search_start = time.perf_counter()
+        if gpu_search:
+            vector = vector.to(self.local_search_device)
+        indices, scores = self.search_index.search(vector, self.top_k)
+        search_seconds = time.perf_counter() - search_start
+        # ExactDenseIndex synchronizes its own search device before returning.
+        elapsed = time.perf_counter() - start
+        return RetrievalResult(query.id, [self.passages[i].id for i in indices], scores.tolist(), elapsed,
+                               [{'stage': 'dense', 'seconds': elapsed, 'latency_seconds': elapsed,
+                                 'query_embedding_seconds': embedding_seconds, 'vector_search_seconds': search_seconds,
+                                 'candidates': len(self.passages), 'search_device': self.local_search_device,
+                                 'forward_passes': None, 'input_tokens': None}])

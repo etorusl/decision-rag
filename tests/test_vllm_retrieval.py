@@ -1,4 +1,5 @@
 import json
+from contextlib import contextmanager
 
 import httpx
 import numpy as np
@@ -49,7 +50,7 @@ def embeddings_reply(request, calls):
 def test_live_query_encoding_normalized_order_and_usage():
     calls = []
     client = pooling_client(EMBED_MODEL, lambda request: embeddings_reply(request, calls))
-    dense = VLLMDenseRetriever(corpus(), client=client, batch_size=2)
+    dense = VLLMDenseRetriever(corpus(), search_device='cpu', client=client, batch_size=2)
     assert len(calls) == 2
     np.testing.assert_allclose(np.linalg.norm(dense.embeddings, axis=1), 1)
     first = dense.retrieve(Query("q", "where is apple"))
@@ -64,27 +65,33 @@ def test_live_query_encoding_normalized_order_and_usage():
     assert first.stages[0]["forward_passes"] is None
     assert dense.external_inference is True
     assert dense.runtime_metadata["embedding"]["server_version"] == "0.11.2"
+    assert dense.runtime_metadata['search_runtime']['device'] == 'cpu'
+    assert dense.runtime_metadata['search_runtime']['precision'] == 'float32'
+    assert first.stages[0]['query_embedding_seconds'] >= 0
+    assert first.stages[0]['vector_search_seconds'] >= 0
+    assert first.stages[0]['seconds'] >= (
+        first.stages[0]['query_embedding_seconds'] + first.stages[0]['vector_search_seconds'])
 
 
 def test_cache_requires_revision_and_rejects_changed_identity(tmp_path):
     with pytest.raises(ValueError, match="immutable revision"):
-        VLLMDenseRetriever(corpus(), index_dir=tmp_path)
+        VLLMDenseRetriever(corpus(), search_device='cpu', index_dir=tmp_path)
     calls = []
     client = pooling_client(EMBED_MODEL, lambda request: embeddings_reply(request, calls))
-    first = VLLMDenseRetriever(corpus(), index_dir=tmp_path, revision=REVISION, client=client)
+    first = VLLMDenseRetriever(corpus(), search_device='cpu', index_dir=tmp_path, revision=REVISION, client=client)
     assert len(calls) == 1
-    second = VLLMDenseRetriever(corpus(), index_dir=tmp_path, revision=REVISION, client=client)
+    second = VLLMDenseRetriever(corpus(), search_device='cpu', index_dir=tmp_path, revision=REVISION, client=client)
     assert len(calls) == 1
     assert second.runtime_metadata["index_cache_reused"] is True
     np.testing.assert_allclose(first.embeddings, second.embeddings)
     with pytest.raises(ValueError, match="mismatch"):
-        VLLMDenseRetriever(corpus(), index_dir=tmp_path, revision="b" * 40, client=client)
+        VLLMDenseRetriever(corpus(), search_device='cpu', index_dir=tmp_path, revision="b" * 40, client=client)
     with pytest.raises(ValueError, match="mismatch"):
-        VLLMDenseRetriever(corpus(), index_dir=tmp_path, revision=REVISION, dtype="float16", client=client)
+        VLLMDenseRetriever(corpus(), search_device='cpu', index_dir=tmp_path, revision=REVISION, dtype="float16", client=client)
     different = Corpus([Node("root", "", "root"), Node("page", "", "page", "root"),
                         Node("p1", "changed text", "passage", "page")])
     with pytest.raises(ValueError, match="mismatch"):
-        VLLMDenseRetriever(different, index_dir=tmp_path, revision=REVISION, client=client)
+        VLLMDenseRetriever(different, search_device='cpu', index_dir=tmp_path, revision=REVISION, client=client)
 
 
 def test_index_progress_counts_actual_passages_and_reports_cache_reuse(tmp_path):
@@ -93,9 +100,9 @@ def test_index_progress_counts_actual_passages_and_reports_cache_reuse(tmp_path)
     calls = []
     client = pooling_client(EMBED_MODEL, lambda request: embeddings_reply(request, calls))
     with RunReporter(tmp_path / 'logs', progress='off') as reporter:
-        first = VLLMDenseRetriever(corpus(), index_dir=tmp_path / 'index', revision=REVISION,
+        first = VLLMDenseRetriever(corpus(), search_device='cpu', index_dir=tmp_path / 'index', revision=REVISION,
                                    client=client, batch_size=2, reporter=reporter)
-        second = VLLMDenseRetriever(corpus(), index_dir=tmp_path / 'index', revision=REVISION,
+        second = VLLMDenseRetriever(corpus(), search_device='cpu', index_dir=tmp_path / 'index', revision=REVISION,
                                     client=client, reporter=reporter)
     assert len(calls) == 2
     np.testing.assert_allclose(first.embeddings, second.embeddings)
@@ -104,6 +111,39 @@ def test_index_progress_counts_actual_passages_and_reports_cache_reuse(tmp_path)
     assert built['completed'] == built['total'] == 3
     assert built['metrics']['batches'] == 2
     assert any(row['event'] == 'index_cache_loaded' for row in events)
+
+
+@pytest.mark.parametrize('close_fails', [False, True])
+def test_index_and_http_client_close_if_progress_logging_fails(monkeypatch, close_fails):
+    calls, closed = [], []
+    client = pooling_client(EMBED_MODEL, lambda request: embeddings_reply(request, calls))
+    monkeypatch.setattr('decision_rag.vllm_retrieval.httpx.Client', lambda **kwargs: client)
+
+    class Index:
+        def __init__(self):
+            self.metadata = {'index_bytes': 24}
+
+        def close(self):
+            closed.append('index')
+            if close_fails:
+                raise RuntimeError('index cleanup failed')
+
+    monkeypatch.setattr('decision_rag.vllm_retrieval.ExactDenseIndex', lambda *a, **kw: Index())
+
+    class Reporter:
+        @contextmanager
+        def phase(self, name, **kwargs):
+            class Progress:
+                def update(self, *args, **kwargs):
+                    if name == 'Load search index':
+                        raise OSError('log disk full')
+            yield Progress()
+
+    expected = 'index cleanup failed' if close_fails else 'log disk full'
+    with pytest.raises((OSError, RuntimeError), match=expected):
+        VLLMDenseRetriever(corpus(), search_device='cpu', reporter=Reporter())
+    assert closed == ['index']
+    assert client.is_closed
 
 
 @pytest.mark.parametrize("failure", ["indices", "nan", "zero", "dimensions", "model"])
@@ -124,13 +164,13 @@ def test_embedding_responses_fail_closed(failure):
             model = "wrong"
         return httpx.Response(200, json={"model": model, "data": rows})
     with pytest.raises(ValueError):
-        VLLMDenseRetriever(corpus(), client=pooling_client(EMBED_MODEL, bad))
+        VLLMDenseRetriever(corpus(), search_device='cpu', client=pooling_client(EMBED_MODEL, bad))
 
 
 def test_server_must_advertise_requested_model():
     client = pooling_client("wrong-model", lambda request: pytest.fail("Inference must not run"))
     with pytest.raises(ValueError, match="does not advertise"):
-        VLLMDenseRetriever(corpus(), client=client)
+        VLLMDenseRetriever(corpus(), search_device='cpu', client=client)
 
 
 def test_score_uses_official_prompt_preserves_indices_and_reports_unknown_passes():
@@ -174,7 +214,7 @@ def test_dense_rerank_includes_live_dense_and_reranker_work():
         return httpx.Response(200, json={"model": RERANK_MODEL,
                                         "data": [{"index": 0, "score": .1}, {"index": 1, "score": .9},
                                                  {"index": 2, "score": .9}]})
-    retriever = VLLMDenseRerankRetriever(corpus(), candidates=3, top_k=2,
+    retriever = VLLMDenseRerankRetriever(corpus(), search_device='cpu', candidates=3, top_k=2,
                                         embedding_client=embedding_client,
                                         reranker_client=pooling_client(RERANK_MODEL, scores))
     result = retriever.retrieve(Query("q", "apple"))

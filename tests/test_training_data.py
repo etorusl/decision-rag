@@ -49,7 +49,7 @@ def test_training_and_monitoring_keep_complete_dialogues_disjoint(tmp_path):
         train_query("b2", "p-b", "dialogue-b", 2),
     ]
     make_training_data(
-        corpus(), queries, tmp_path / "first", TokenCounter(), monitor_fraction=0.5, gold_page_probability=1.0
+        corpus(), queries, tmp_path / "first", TokenCounter(), search_device="cpu", monitor_fraction=0.5, gold_page_probability=1.0
     )
     train = records(tmp_path / "first/train.jsonl")
     monitor = records(tmp_path / "first/monitor.jsonl")
@@ -66,7 +66,7 @@ def test_training_and_monitoring_keep_complete_dialogues_disjoint(tmp_path):
         corpus(),
         queries,
         tmp_path / "second",
-        TokenCounter(),
+        TokenCounter(), search_device="cpu",
         monitor_fraction=0.5,
         gold_page_probability=1.0,
     )
@@ -77,7 +77,7 @@ def test_training_and_monitoring_keep_complete_dialogues_disjoint(tmp_path):
 def test_identical_gold_text_is_never_negative(tmp_path):
     queries = [train_query("a", conversation="one"), train_query("b", conversation="two")]
     make_training_data(
-        corpus(), queries, tmp_path, TokenCounter(), monitor_fraction=0.5, gold_page_probability=1.0
+        corpus(), queries, tmp_path, TokenCounter(), search_device="cpu", monitor_fraction=0.5, gold_page_probability=1.0
     )
     all_records = records(tmp_path / "train.jsonl") + records(tmp_path / "monitor.jsonl")
     passage_records = [r for r in all_records if r["metadata"]["stage"] == "passages"]
@@ -93,7 +93,7 @@ def test_identical_gold_text_is_never_negative(tmp_path):
 def test_rejects_evaluation_queries_before_writing(tmp_path, split):
     queries = [Query("q", "question", {"p-a": 1}, metadata={"split": split})]
     with pytest.raises(ValueError, match="train"):
-        make_training_data(corpus(), queries, tmp_path, TokenCounter())
+        make_training_data(corpus(), queries, tmp_path, TokenCounter(), search_device="cpu")
     assert not (tmp_path / "train.jsonl").exists()
 
 
@@ -108,7 +108,7 @@ def test_cqa_monitor_split_uses_source_pages_including_questions_without_evidenc
         corpus(),
         queries,
         tmp_path,
-        TokenCounter(),
+        TokenCounter(), search_device="cpu",
         dataset="conditionalqa",
         monitor_fraction=0.5,
         gold_page_probability=1.0,
@@ -131,10 +131,10 @@ def test_training_rejects_duplicate_queries_and_unknown_gold(tmp_path, invalid):
     else:
         queries.append(train_query("bad", "missing", "three"))
     with pytest.raises(ValueError):
-        make_training_data(corpus(), queries, tmp_path, TokenCounter(), monitor_fraction=0.5)
+        make_training_data(corpus(), queries, tmp_path, TokenCounter(), search_device="cpu", monitor_fraction=0.5)
     assert not (tmp_path / "train.jsonl").exists()
 
 
 def test_training_requires_at_least_two_groups(tmp_path):
     with pytest.raises(ValueError, match="two"):
-        make_training_data(corpus(), [train_query("q", conversation="one")], tmp_path, TokenCounter())
+        make_training_data(corpus(), [train_query("q", conversation="one")], tmp_path, TokenCounter(), search_device="cpu")

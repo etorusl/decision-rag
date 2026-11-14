@@ -37,6 +37,8 @@ def flatten_summary(path):
     latency, work = data["latency"], data.get("work", {})
     count = latency.get("queries", 0)
     config = data.get("config", {})
+    search = config.get('runtime', {}).get('search_runtime', {})
+    legacy_search = config.get('runtime', {}).get('search', '')
     env = data.get("environment", {})
     query_hashes = sorted(v for k, v in data.get("inputs", {}).items() if Path(k).name == "queries.jsonl")
     corpus_hashes = sorted(v for k, v in data.get("inputs", {}).items() if Path(k).name == "corpus.jsonl")
@@ -53,10 +55,16 @@ def flatten_summary(path):
         "git_dirty": env.get("git_dirty", ""),
         "gpu": env.get("gpu", ""),
         "timing_scope": data.get("timing_scope", ""),
+        "search_device": search.get('device', 'cpu' if legacy_search.startswith('CPU exact') else ''),
+        "search_precision": search.get('precision', ''),
+        "search_index_gib": search['index_bytes'] / 2**30 if search.get('index_bytes') is not None else None,
         "config_json": json.dumps(config, sort_keys=True),
     }
     row.update({f"quality.{key}": value for key, value in data["quality"].items()})
     row.update({f"latency.{key}": value for key, value in latency.items() if key != "queries"})
+    for component in ('query_embedding', 'vector_search'):
+        seconds = data.get('component_latency', {}).get(component, {}).get('mean_seconds')
+        row[f'mean_{component}_ms'] = seconds * 1000 if seconds is not None else None
     for key in ("input_tokens", "forward_passes", "requests", "prompt_requests", "completion_tokens", "cached_tokens"):
         row[f"work.{key}"] = work.get(key, 0)
         value = work.get(key, 0)
@@ -136,6 +144,10 @@ def markdown_text(rows):
                 ("latency.p95_seconds", "p95 s"),
                 ("latency.p99_seconds", "p99 s"),
                 ("latency.serial_queries_per_second", "Serial queries/s"),
+                ("mean_query_embedding_ms", "Query embedding ms"),
+                ("mean_vector_search_ms", "Vector search ms"),
+                ("search_index_gib", "Index GiB"),
+                ("gpu_device_peak_used_gib", "Device peak GiB"),
                 ("gpu_peak_allocated_gib", "GPU allocated GiB"),
                 ("gpu_peak_reserved_gib", "GPU reserved GiB"),
                 ("work.input_tokens_per_query", "Input tokens/query"),
@@ -155,6 +167,8 @@ def markdown_text(rows):
                 ("dedup_text", "Text dedup"),
                 ("warmup_queries", "Warmups"),
                 ("gpu", "GPU"),
+                ("search_device", "Search device"),
+                ("search_precision", "Search precision"),
                 ("git_dirty", "Dirty tree"),
             ],
         ),

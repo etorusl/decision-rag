@@ -18,10 +18,13 @@ python -m decision_rag.datasets nq-dapr \
 The source directory contains `corpus.jsonl` and `test.jsonl` in the DAPR document/chunk schema. Retain its
 source manifest and do not filter the corpus to pages present in the evaluation qrels.
 
-Build the hierarchy:
+Install the optional GPU clustering dependency in the HF environment and build the hierarchy:
 
 ```bash
-python -m decision_rag.hierarchy \
+source .venv/bin/activate
+python -m pip install -e '.[gpu-clustering]' --extra-index-url https://pypi.nvidia.com
+CUDA_VISIBLE_DEVICES=1 python -m pytest -q tests/test_hierarchy.py
+CUDA_VISIBLE_DEVICES=1 python -m decision_rag.hierarchy \
   data/nq-dapr/corpus.jsonl data/nq-dapr/corpus.clustered.jsonl \
   --clusters 1000 --seed 42 --device cuda --batch-size 64 \
   --model-name intfloat/e5-base-v2 --summary-model Qwen/Qwen3-8B
@@ -33,15 +36,24 @@ E5's 512-token input limit. Truncated page-feature inputs are counted in the man
 choices follow the [E5 model card](https://huggingface.co/intfloat/e5-base-v2); the DecisionRAG
 paper does not specify its tokenizer or sentence splitter.
 
-It then runs full CPU k-means with 1,000 clusters, fixed seed, 10 initializations and at most
-300 iterations. These solver choices are recorded, not assumed to be the authors' undisclosed
-choices. Full k-means over 108k vectors can take substantial CPU time; this offline cost is
-separate from retrieval latency. `--n-init` and `--max-iter` permit explicit cost/quality experiments.
-The API uses the documented [scikit-learn KMeans](https://scikit-learn.org/stable/modules/generated/sklearn.cluster.KMeans.html).
+It then runs GPU k-means with 1,000 clusters, a fixed seed, 10 initializations and at most
+300 iterations through the direct [cuML 26.10 KMeans API](https://docs.nvidia.com/cuml/26.10/api/generated/cuml.cluster.KMeans/).
+This uses FP32 and `scalable-k-means++` initialization on logical `cuda:0`, which is physical
+GPU 1 under the mask above. cuML is an optional Linux/CUDA 12 dependency; a missing dependency,
+unavailable CUDA device or GPU allocation error stops the build without CPU fallback.
+The test command above runs actual tiny cuML clustering and GPU centroid/title-selection
+checks when CUDA and the optional dependency are installed; these tests are skipped on CPU machines.
+`--device cpu` explicitly selects the older scikit-learn Lloyd solver for a separate CPU experiment.
+The chosen device, implementation, precision and initialization are recorded. The GPU solver can
+produce different assignments from old CPU runs even with the same seed; reuse saved assignments
+to hold the hierarchy constant. `--n-init` and `--max-iter` permit explicit cost/quality experiments.
+All construction costs are recorded separately from retrieval latency.
 
 Finally, Qwen3-8B describes each cluster from at most 300 titles ordered by Euclidean distance to
-the cluster centroid. The embedding model is deleted and its CUDA cache released before loading
-the summarizer, so both models need not occupy VRAM together. The summarizer uses the paper's
+the cluster centroid. Distances and top-k selection also run on GPU; exact ties use ascending
+page IDs. When reusing assignments alone, centroids are recomputed on GPU as well. Text extraction,
+title strings and artifact I/O remain on CPU. The embedding model, clustering estimator and
+numeric preprocessing tensors are released before loading the summarizer. The summarizer uses the paper's
 instruction, local greedy generation and `enable_thinking=False`, supported by the
 [Qwen3 model card](https://huggingface.co/Qwen/Qwen3-8B). No paid API is used.
 
@@ -65,7 +77,7 @@ Alongside the output corpus, `corpus.clustered.hierarchy/` contains:
 To rebuild the exact same tree without loading either model:
 
 ```bash
-python -m decision_rag.hierarchy \
+CUDA_VISIBLE_DEVICES=1 python -m decision_rag.hierarchy \
   data/nq-dapr/corpus.jsonl data/nq-dapr/corpus.reused.jsonl --clusters 1000 \
   --assignments-path data/nq-dapr/corpus.clustered.hierarchy/assignments.json \
   --summaries-path data/nq-dapr/corpus.clustered.hierarchy/summaries.json

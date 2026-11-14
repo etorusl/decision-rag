@@ -88,8 +88,8 @@ def _benchmark(args, reporter):
                       'runtime': getattr(backend, 'runtime_metadata', {})}
         elif args.method == 'bm25':
             from .baselines import BM25Retriever
-            retriever = BM25Retriever(corpus, args.top_k)
-            config = vars(args)
+            retriever = BM25Retriever(corpus, args.top_k, device=args.search_device)
+            config = {**vars(args), 'runtime': retriever.runtime_metadata}
         elif args.engine == 'vllm':
             from .vllm_retrieval import VLLMDenseRerankRetriever, VLLMDenseRetriever
             if args.method == 'dense':
@@ -97,7 +97,7 @@ def _benchmark(args, reporter):
                     corpus, model_name=args.model or 'Qwen/Qwen3-Embedding-8B',
                     base_url=args.embedding_url, top_k=args.top_k, batch_size=args.batch_size,
                     index_dir=args.index_dir, revision=args.embedding_revision, timeout=args.http_timeout,
-                    dtype=args.dtype, reporter=reporter)
+                    dtype=args.dtype, reporter=reporter, search_device=args.search_device)
             else:
                 retriever = VLLMDenseRerankRetriever(
                     corpus, embedding_model=args.model or 'Qwen/Qwen3-Embedding-8B',
@@ -105,7 +105,7 @@ def _benchmark(args, reporter):
                     reranker_base_url=args.reranker_url, top_k=args.top_k, candidates=args.rerank_candidates,
                     batch_size=args.batch_size, index_dir=args.index_dir,
                     embedding_revision=args.embedding_revision, reranker_revision=args.reranker_revision,
-                    timeout=args.http_timeout, dtype=args.dtype, reporter=reporter)
+                    timeout=args.http_timeout, dtype=args.dtype, reporter=reporter, search_device=args.search_device)
             config = {**vars(args), 'runtime': retriever.runtime_metadata}
         elif args.method == 'dense-rerank':
             from .reranking import DenseRerankRetriever
@@ -113,13 +113,14 @@ def _benchmark(args, reporter):
                 corpus, embedding_model=args.model or 'Qwen/Qwen3-Embedding-8B',
                 reranker_model=args.reranker_model, top_k=args.top_k, candidates=args.rerank_candidates,
                 device=args.device, batch_size=args.batch_size, index_dir=args.index_dir,
-                dtype=args.dtype, max_length=args.rerank_max_length)
-            config = vars(args)
+                dtype=args.dtype, max_length=args.rerank_max_length, search_device=args.search_device)
+            config = {**vars(args), 'runtime': retriever.runtime_metadata}
         else:
             from .baselines import DenseRetriever
             retriever = DenseRetriever(corpus, args.model or 'Qwen/Qwen3-Embedding-0.6B', args.top_k,
-                                       args.device, args.batch_size, args.index_dir, dtype=args.dtype)
-            config = vars(args)
+                                       args.device, args.batch_size, args.index_dir, dtype=args.dtype,
+                                       search_device=args.search_device)
+            config = {**vars(args), 'runtime': retriever.runtime_metadata}
         phase.update()
     try:
         result = evaluate(retriever, queries, args.output, warmup=args.warmup,
@@ -174,6 +175,8 @@ def main(argv=None):
     bench.add_argument('--no-prefix-prime', action='store_true')
     bench.add_argument('--gpu-monitor-index', help='Physical nvidia-smi GPU index for device-level telemetry')
     bench.add_argument('--index-dir')
+    bench.add_argument('--search-device', default='cuda',
+                       help='Device for dense/BM25 scoring and top-k (default: cuda; explicit cpu for diagnostics)')
     bench.add_argument('--batch-size', type=int, default=16)
     bench.add_argument('--reranker-model', default='Qwen/Qwen3-Reranker-8B')
     bench.add_argument('--rerank-candidates', type=int, default=100)
@@ -190,6 +193,7 @@ def main(argv=None):
     records.add_argument('--max-candidates', type=int, default=128)
     records.add_argument('--seed', type=int, default=42)
     records.add_argument('--limit', type=int)
+    records.add_argument('--search-device', default='cuda', help='Device for BM25 negative mining (default: cuda)')
     compare = subs.add_parser('compare', help='Paired bootstrap confidence interval')
     compare.add_argument('run_a'); compare.add_argument('run_b')
     compare.add_argument('--metric', default='recall@10')
@@ -220,6 +224,7 @@ def main(argv=None):
                                     TokenCounter(), dataset=args.dataset, seed=args.seed,
                                     max_tokens=args.max_tokens, max_candidates=args.max_candidates,
                                     max_queries=args.limit,
+                                    search_device=args.search_device,
                                     monitor_fraction=.1 if args.dataset == 'conditionalqa' else .03)
     else:
         output = Path(args.output)

@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import random
+from contextlib import closing
 from pathlib import Path
 
 from .baselines import BM25Retriever
@@ -18,7 +19,7 @@ from .retrieval import DecisionRetriever, RetrievalConfig
 
 def make_training_data(corpus, queries, output_dir, backend, *, dataset='multidoc2dial', seed=42,
                        max_tokens=8192, max_candidates=128, monitor_fraction=.03,
-                       gold_page_probability=.85, max_queries=None):
+                       gold_page_probability=.85, max_queries=None, search_device='cuda'):
     if any(q.metadata.get('split') not in {'train', 'training'} for q in queries):
         raise ValueError("Training records require queries marked metadata.split=train; never use evaluation labels")
     if not 0 < monitor_fraction < 1 or not 0 <= gold_page_probability <= 1:
@@ -53,11 +54,11 @@ def make_training_data(corpus, queries, output_dir, backend, *, dataset='multido
     monitor = set(units[:max(1, round(len(units) * monitor_fraction))])
     scorer = DecisionRetriever(corpus, backend, RetrievalConfig(max_request_tokens=max_tokens,
                                                                max_candidates=max_candidates))
-    bm25 = BM25Retriever(corpus, top_k=100)
+    bm25 = BM25Retriever(corpus, top_k=100, device=search_device)
     counts = {"train": 0, "monitor": 0}
     train_path, valid_path = output / "train.jsonl.partial", output / "monitor.jsonl.partial"
     seen = set()
-    with train_path.open("w", encoding="utf-8") as train, valid_path.open("w", encoding="utf-8") as valid:
+    with closing(bm25), train_path.open("w", encoding="utf-8") as train, valid_path.open("w", encoding="utf-8") as valid:
         for query in queries[:max_queries] if max_queries else queries:
             gold = {pid for pid, rel in query.relevant_ids.items() if rel > 0}
             gold_pages = set(query.metadata.get('gold_page_ids', [])) | {corpus.page_id(pid) for pid in gold}
@@ -107,6 +108,7 @@ def make_training_data(corpus, queries, output_dir, backend, *, dataset='multido
     train_path.replace(output / 'train.jsonl')
     valid_path.replace(output / 'monitor.jsonl')
     manifest = {'dataset': dataset, 'seed': seed, 'training_records': counts['train'], 'monitor_records': counts['monitor'],
+                'search_runtime': bm25.runtime_metadata['search_runtime'],
                 'monitor_units': sorted(monitor), 'monitor_fraction': monitor_fraction,
                 'max_tokens': max_tokens, 'max_candidates': max_candidates,
                 'gold_page_probability': gold_page_probability,

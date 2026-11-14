@@ -109,7 +109,11 @@ def test_dense_reranker_uses_fresh_candidates_and_stable_ties(fake_hf, monkeypat
     class FakeDense:
         def __init__(self, *args, **kwargs):
             assert kwargs["dtype"] == "float32"
+            assert kwargs['search_device'] == 'cpu'
             self.calls, self.resets = 0, 0
+            self.local_search_device = 'cpu'
+            self.runtime_metadata = {'search_runtime': {'device': 'cpu'}}
+            self.closed = False
 
         def reset(self):
             self.resets += 1
@@ -118,8 +122,11 @@ def test_dense_reranker_uses_fresh_candidates_and_stable_ties(fake_hf, monkeypat
             self.calls += 1
             return RetrievalResult(query.id, ["p3", "p2", "p1"], [3.0, 2.0, 1.0], 0, [])
 
+        def close(self):
+            self.closed = True
+
     monkeypatch.setattr("decision_rag.reranking.DenseRetriever", FakeDense)
-    retriever = DenseRerankRetriever(corpus, top_k=2, candidates=3, device="cpu", dtype="float32")
+    retriever = DenseRerankRetriever(corpus, top_k=2, candidates=3, device="cpu", dtype="float32", search_device='cpu')
     result = retriever.retrieve(Query("q", "question"))
     assert result.ids == ["p2", "p1"]  # Equal reranker scores retain the dense order.
     assert retriever.dense.calls == 1
@@ -127,5 +134,20 @@ def test_dense_reranker_uses_fresh_candidates_and_stable_ties(fake_hf, monkeypat
     assert result.latency_seconds >= result.stages[0]["latency_seconds"]
     retriever.reset()
     assert retriever.dense.resets == 1
+    assert retriever.runtime_metadata['search_runtime']['device'] == 'cpu'
+    retriever.close()
+    assert retriever.dense.closed and retriever.reranker.model is None
     with pytest.raises(ValueError, match="candidate count"):
         DenseRerankRetriever(corpus, top_k=20, candidates=10)
+
+
+def test_reranker_load_failure_closes_dense_index(monkeypatch):
+    dense = SimpleNamespace(close=lambda: closed.append(True))
+    closed = []
+    monkeypatch.setattr('decision_rag.reranking.DenseRetriever', lambda *a, **k: dense)
+    def fail(*args, **kwargs):
+        raise RuntimeError('failed to load reranker')
+    monkeypatch.setattr('decision_rag.reranking.QwenReranker', fail)
+    with pytest.raises(RuntimeError, match='failed to load'):
+        DenseRerankRetriever(None)
+    assert closed == [True]

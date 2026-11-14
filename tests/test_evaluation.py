@@ -173,6 +173,25 @@ def test_progress_and_logging_are_outside_retrieval_latency(tmp_path, monkeypatc
     assert updates[-1] == ('Benchmark', {'mean_latency_s': .25, 'labeled_queries': 1, 'recall_at_10': 1.0})
 
 
+def test_mixed_vllm_and_local_search_reports_components_without_inventing_work(tmp_path):
+    class MixedRetriever(StatefulRetriever):
+        external_inference = True
+        local_search_device = 'cuda:0'
+
+        def retrieve(self, query):
+            result = super().retrieve(query)
+            result.stages[0].update(query_embedding_seconds=.2, vector_search_seconds=.03, forward_passes=None)
+            return result
+
+    summary = evaluate(MixedRetriever(), [Query('q', 'question', {'p1': 1})], tmp_path)
+    assert summary['inference_process'] == 'external_vllm_server_and_local_gpu_search'
+    assert summary['local_search_device'] == 'cuda:0'
+    assert summary['work']['forward_passes'] is None
+    assert summary['component_latency']['query_embedding']['mean_seconds'] == .2
+    assert summary['component_latency']['vector_search']['mean_seconds'] == .03
+    assert 'gpu_peak_allocated_bytes' not in summary  # client allocator cannot measure vLLM servers
+
+
 def test_failed_query_keeps_partial_results_and_diagnostic_logs(tmp_path, capsys):
     class FailingRetriever(StatefulRetriever):
         def retrieve(self, query):

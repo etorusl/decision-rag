@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .dense_search import resolve_search_device, stable_torch_top_k
 from .schema import Corpus, write_jsonl
 
 SUMMARY_INSTRUCTION = (
@@ -60,11 +61,14 @@ def page_features(corpus: Corpus) -> tuple[list, list[str]]:
     return pages, texts
 
 
-def _release_gpu() -> None:
+def _release_gpu(device: str | None = None) -> None:
     gc.collect()
+    if device is not None and not str(device).startswith('cuda'):
+        return
     import torch
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        with torch.cuda.device(device):
+            torch.cuda.empty_cache()
 
 
 def encode_pages(texts: list[str], model_name: str, device: str, batch_size: int,
@@ -96,23 +100,66 @@ def encode_pages(texts: list[str], model_name: str, device: str, batch_size: int
         return np.concatenate(vectors).astype(np.float32), metadata
     finally:
         del model, tokenizer
-        _release_gpu()
+        _release_gpu(device)
+
+
+def _numeric_device(device):
+    try:
+        return resolve_search_device(device)
+    except RuntimeError as exc:
+        raise RuntimeError('GPU hierarchy preprocessing needs a working CUDA environment; '
+                           'use --device cpu only for an explicitly separate CPU experiment') from exc
 
 
 def fit_clusters(embeddings: np.ndarray, clusters: int, seed: int,
-                 n_init: int = 10, max_iter: int = 300) -> tuple[np.ndarray, np.ndarray, dict]:
-    from sklearn.cluster import KMeans
+                 n_init: int = 10, max_iter: int = 300, *, device: str = 'cuda') -> tuple[np.ndarray, np.ndarray, dict]:
     if embeddings.ndim != 2 or not np.isfinite(embeddings).all():
         raise ValueError("Embeddings must be a finite 2D matrix")
     if not 1 <= clusters <= len(embeddings):
         raise ValueError("clusters must be between 1 and the number of pages")
-    model = KMeans(n_clusters=clusters, random_state=seed, n_init=n_init,
-                   max_iter=max_iter, algorithm="lloyd")
-    labels = model.fit_predict(embeddings)
+    if min(n_init, max_iter) < 1:
+        raise ValueError('n_init and max_iter must be positive')
+    device = _numeric_device(device)
+    common = {'seed': seed, 'n_init': n_init, 'max_iter': max_iter, 'device': device}
+    if device == 'cpu':
+        from sklearn.cluster import KMeans
+
+        model = KMeans(n_clusters=clusters, random_state=seed, n_init=n_init,
+                       max_iter=max_iter, algorithm='lloyd')
+        labels = model.fit_predict(embeddings)
+        centroids = model.cluster_centers_
+        metadata = {**common, 'backend': 'scikit-learn', 'algorithm': 'KMeans/lloyd',
+                    'init': 'k-means++', 'precision': str(embeddings.dtype),
+                    'iterations': int(model.n_iter_), 'inertia': float(model.inertia_)}
+    else:
+        try:
+            import cupy
+            from cuml.cluster import KMeans
+        except ImportError as exc:
+            raise RuntimeError("GPU clustering requires cuML: pip install -e '.[gpu-clustering]' "
+                               '--extra-index-url https://pypi.nvidia.com; no CPU fallback was performed') from exc
+        model = None
+        with cupy.cuda.Device(int(device.split(':')[1])) as gpu:
+            try:
+                model = KMeans(n_clusters=clusters, random_state=seed, n_init=n_init,
+                               max_iter=max_iter, init='scalable-k-means++', output_type='numpy')
+                model.fit(np.asarray(embeddings, dtype=np.float32))
+                labels = np.asarray(model.labels_, dtype=np.int64)
+                centroids = np.asarray(model.cluster_centers_, dtype=np.float32)
+                iterations = getattr(model, 'n_iter_', None)
+                metadata = {**common, 'backend': 'cuML', 'algorithm': 'cuML/KMeans',
+                            'init': 'scalable-k-means++', 'precision': 'float32',
+                            'iterations': int(iterations) if iterations is not None else None,
+                            'inertia': float(model.inertia_)}
+                gpu.synchronize()
+            finally:
+                # Release the clustering estimator and allocator scratch before the summary LM.
+                del model
+                gc.collect()
+                cupy.get_default_memory_pool().free_all_blocks()
+                cupy.get_default_pinned_memory_pool().free_all_blocks()
     validate_labels(labels, len(embeddings), clusters)
-    return labels, model.cluster_centers_, {"algorithm": "KMeans/lloyd", "seed": seed,
-                                          "n_init": n_init, "max_iter": max_iter,
-                                          "iterations": int(model.n_iter_), "inertia": float(model.inertia_)}
+    return labels, centroids, metadata
 
 
 def validate_labels(labels: np.ndarray, pages: int, clusters: int) -> None:
@@ -122,16 +169,67 @@ def validate_labels(labels: np.ndarray, pages: int, clusters: int) -> None:
         raise ValueError("Every requested cluster must be nonempty, with labels 0 through clusters-1")
 
 
+def recompute_centroids(embeddings: np.ndarray, labels: np.ndarray, clusters: int,
+                        *, device: str = 'cuda') -> np.ndarray:
+    """Rebuild centers for saved assignments on the selected numeric device."""
+    validate_labels(labels, len(embeddings), clusters)
+    device = _numeric_device(device)
+    if device == 'cpu':
+        return np.stack([embeddings[labels == i].mean(axis=0) for i in range(clusters)])
+    import torch
+
+    vectors = assignments = centers = counts = None
+    try:
+        with torch.inference_mode():
+            vectors = torch.as_tensor(embeddings, device=device, dtype=torch.float32)
+            assignments = torch.as_tensor(labels, device=device, dtype=torch.long)
+            centers = torch.zeros((clusters, embeddings.shape[1]), device=device, dtype=torch.float32)
+            centers.index_add_(0, assignments, vectors)
+            counts = torch.bincount(assignments, minlength=clusters)
+            centers /= counts[:, None]
+            result = centers.cpu().numpy()
+            torch.cuda.synchronize(device)
+            return result
+    finally:
+        del vectors, assignments, centers, counts
+        _release_gpu(device)
+
+
 def typical_titles(pages, embeddings: np.ndarray, labels: np.ndarray,
-                   centroids: np.ndarray, max_titles: int = 300) -> dict[str, list[str]]:
+                   centroids: np.ndarray, max_titles: int = 300, *, device: str = 'cuda') -> dict[str, list[str]]:
     if not 1 <= max_titles <= 300:
         raise ValueError("max_titles must be between 1 and 300")
+    validate_labels(labels, len(embeddings), len(centroids))
+    device = _numeric_device(device)
+    # Group integer labels once; sorting page-ID strings defines deterministic tie order.
+    groups = [[] for _ in range(len(centroids))]
+    for index, label in enumerate(labels):
+        groups[int(label)].append(index)
     titles = {}
-    for cluster in range(len(centroids)):
-        members = np.flatnonzero(labels == cluster)
-        distances = np.sum((embeddings[members] - centroids[cluster]) ** 2, axis=1)
-        order = sorted(range(len(members)), key=lambda i: (float(distances[i]), pages[members[i]].id))
-        titles[str(cluster)] = [pages[members[i]].title or pages[members[i]].text for i in order[:max_titles]]
+    if device == 'cpu':
+        for cluster, group in enumerate(groups):
+            members = np.asarray(sorted(group, key=lambda i: pages[i].id))
+            distances = np.sum((embeddings[members] - centroids[cluster]) ** 2, axis=1)
+            order = np.argsort(distances, kind='stable')[:max_titles]
+            titles[str(cluster)] = [pages[members[i]].title or pages[members[i]].text for i in order]
+        return titles
+    import torch
+
+    vectors = centers = members = distances = order = None
+    try:
+        with torch.inference_mode():
+            vectors = torch.as_tensor(embeddings, device=device, dtype=torch.float32)
+            centers = torch.as_tensor(centroids, device=device, dtype=torch.float32)
+            for cluster, group in enumerate(groups):
+                by_id = sorted(group, key=lambda i: pages[i].id)
+                members = torch.tensor(by_id, device=device, dtype=torch.long)
+                distances = (vectors[members] - centers[cluster]).square().sum(dim=1)
+                order = stable_torch_top_k(-distances, max_titles).cpu().tolist()
+                titles[str(cluster)] = [pages[by_id[i]].title or pages[by_id[i]].text for i in order]
+            torch.cuda.synchronize(device)
+    finally:
+        del vectors, centers, members, distances, order
+        _release_gpu(device)
     return titles
 
 
@@ -192,7 +290,7 @@ def summarize_clusters(titles: dict[str, list[str]], model_name: str, device: st
                            "max_input_tokens": max_input_tokens, "clusters": details}
     finally:
         del model, tokenizer
-        _release_gpu()
+        _release_gpu(device)
 
 
 def _validate_summaries(summaries: dict, clusters: int) -> None:
@@ -262,7 +360,7 @@ def cluster_corpus(input_path: str | Path, output_path: str | Path,
         embed_info["artifact_sha256"] = file_sha256(vector_file)
         timing["embedding_seconds"] = time.perf_counter() - stage_started
         stage_started = time.perf_counter()
-        labels, centroids, cluster_info = fit_clusters(embeddings, clusters, seed, n_init, max_iter)
+        labels, centroids, cluster_info = fit_clusters(embeddings, clusters, seed, n_init, max_iter, device=device)
         timing["kmeans_seconds"] = time.perf_counter() - stage_started
 
     assignment_hash = _hash_json(labels.tolist())
@@ -283,11 +381,15 @@ def cluster_corpus(input_path: str | Path, output_path: str | Path,
             # Assignments alone cannot recover typicality; recompute vectors without changing labels.
             embeddings, embed_info = encode_pages(texts, model_name, device, batch_size, model_revision)
         if centroids is None:
-            centroids = np.stack([embeddings[labels == i].mean(axis=0) for i in range(clusters)])
-        titles = typical_titles(pages, embeddings, labels, centroids, max_titles)
+            centroids = recompute_centroids(embeddings, labels, clusters, device=device)
+            cluster_info['centroid_reduction'] = 'numpy mean' if device == 'cpu' else 'torch index_add/bincount FP32'
+        titles = typical_titles(pages, embeddings, labels, centroids, max_titles, device=device)
         _write_json(artifact_dir / "summary_titles.json", titles)
         summaries, summary_info = summarize_clusters(titles, summary_model, device, summary_revision,
                                                      max_summary_tokens)
+        summary_info['title_selection'] = {'device': _numeric_device(device),
+                                           'distance': 'squared Euclidean', 'tie_break': 'page ID ascending',
+                                           'precision': 'float32' if device != 'cpu' else str(embeddings.dtype)}
     _validate_summaries(summaries, clusters)
     timing["summary_seconds"] = time.perf_counter() - stage_started
     _write_json(artifact_dir / "summaries.json", {"schema_version": 1, **identity,
@@ -311,7 +413,7 @@ def cluster_corpus(input_path: str | Path, output_path: str | Path,
     write_jsonl(output_path, nodes())
     timing["total_seconds"] = time.perf_counter() - started
     versions = {}
-    for package in ("numpy", "torch", "transformers", "scikit-learn"):
+    for package in ("numpy", "torch", "transformers", "scikit-learn", "cuml-cu12", "cupy-cuda12x"):
         try:
             versions[package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:

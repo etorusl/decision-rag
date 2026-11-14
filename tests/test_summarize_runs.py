@@ -72,6 +72,34 @@ def test_reporter_cli_writes_outputs_and_preserves_source(tmp_path, capsys):
     assert source.read_bytes() == original
 
 
+def test_reporter_exposes_search_device_and_component_latency(tmp_path):
+    source = write_summary(tmp_path / 'gpu')
+    summary = json.loads(source.read_text())
+    summary['config']['runtime'] = {'search_runtime': {
+        'device': 'cuda:0', 'precision': 'float32', 'index_bytes': 2**30}}
+    summary['component_latency'] = {'query_embedding': {'mean_seconds': .025},
+                                    'vector_search': {'mean_seconds': .0005}}
+    summary['gpu_telemetry'] = {'samples': 10, 'peak_device_used_bytes': 40 * 2**30}
+    source.write_text(json.dumps(summary))
+    row = reporter.flatten_summary(source)
+    assert row['search_device'] == 'cuda:0'
+    assert row['search_precision'] == 'float32'
+    assert row['search_index_gib'] == 1
+    assert row['mean_query_embedding_ms'] == 25
+    assert row['mean_vector_search_ms'] == .5
+    assert row['gpu_device_peak_used_gib'] == 40
+    markdown = reporter.markdown_text([row])
+    assert 'Search device' in markdown and 'cuda:0' in markdown
+    assert 'Query embedding ms' in markdown and 'Vector search ms' in markdown
+    assert 'Device peak GiB' in markdown
+    # Pre-GPU-search runs still identify their known CPU search in comparisons.
+    summary['config']['runtime'] = {'search': 'CPU exact dot product of normalized embeddings'}
+    source.write_text(json.dumps(summary))
+    legacy = reporter.flatten_summary(source)
+    assert legacy['search_device'] == 'cpu'
+    assert legacy['search_precision'] == ''
+
+
 def test_reporter_handles_missing_fields_and_invalid_input(tmp_path):
     path = tmp_path / "summary.json"
     path.write_text(json.dumps({"quality": {}, "latency": {}}))

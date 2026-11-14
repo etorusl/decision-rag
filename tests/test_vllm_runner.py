@@ -227,10 +227,13 @@ def test_default_pipeline_uses_ready_vllm_models_and_releases_pooling_before_lm(
     for call in benchmarks[1:3]:
         assert option(call, "--engine") == "vllm"
         assert option(call, "--embedding-revision") == "a" * 40
+        assert option(call, '--search-device') == 'cuda'
+    assert option(benchmarks[0], '--search-device') == 'cuda'
     for call in benchmarks[3:]:
         assert option(call, "--backend") == "vllm"
         assert option(call, "--preset") == "generic"
         assert option(call, "--model-revision") == "a" * 40
+        assert '--search-device' not in call
     assert events.index(("close", "embedding", "reranker")) < events.index(("start", "decision"))
     assert not any("training" in str(call) or "--backend hf" in str(call) for call in calls)
 
@@ -242,8 +245,22 @@ def test_ablations_run_only_inference_with_no_pooling_servers(fake_run):
     assert len(benchmarks) == 7
     assert all(option(call, "--backend") == "vllm" for call in benchmarks)
     assert all("--limit" not in call for call in benchmarks)
+    assert all('--search-device' not in call for call in benchmarks)
     assert [event for event in events if event[0] == "start"] == [("start", "decision")]
     assert events[-1] == ("close", "decision")
+
+
+def test_cpu_search_requires_explicit_selection_and_is_recorded(fake_run, tmp_path):
+    calls, _, masks = fake_run
+    runner.main(['scifact', '3', '--run-tag', 'cpu-search', '--search-device', 'cpu'])
+    dense = [call for call in calls if '--engine' in call]
+    assert len(dense) == 2
+    assert all(option(call, '--search-device') == 'cpu' for call in dense)
+    bm25 = next(call for call in calls if '--method' in call and option(call, '--method') == 'bm25')
+    assert option(bm25, '--search-device') == 'cpu'
+    assert set(masks) == {'1'}  # Model inference remains on the selected GPU.
+    config = json.loads((tmp_path / 'results/cpu-search/scifact/server-config.json').read_text())
+    assert config['search_device'] == 'cpu'
 
 
 def test_benchmark_failure_still_exits_pooling_context(fake_run, monkeypatch, tmp_path):

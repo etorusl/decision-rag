@@ -80,6 +80,12 @@ class QwenReranker:
             raise ValueError("max_length is too small for the official reranker framing")
         self.name = model_name
 
+    def close(self):
+        self.model = None
+        if str(self.device).startswith('cuda'):
+            with torch.cuda.device(self.device):
+                torch.cuda.empty_cache()
+
     def _encode(self, query: str, documents: Sequence[str]):
         header = f"<Instruct>: {self.instruction}\n<Query>: {query}\n<Document>: "
         available = self.max_length - len(self.prefix_ids) - len(self.suffix_ids)
@@ -173,24 +179,39 @@ class DenseRerankRetriever:
         max_batch_tokens: int = 32768,
         truncation: str = "document_tail",
         instruction: str = DEFAULT_INSTRUCTION,
+        search_device: str = 'cuda',
     ):
         if top_k <= 0 or candidates < top_k:
             raise ValueError("Require 0 < top_k <= dense candidate count")
         self.corpus, self.top_k = corpus, top_k
-        self.dense = DenseRetriever(corpus, embedding_model, candidates, device, batch_size, index_dir, dtype=dtype)
-        self.reranker = QwenReranker(
-            reranker_model,
-            device=device,
-            dtype=dtype,
-            batch_size=batch_size,
-            max_length=max_length,
-            max_batch_tokens=max_batch_tokens,
-            truncation=truncation,
-            instruction=instruction,
-        )
+        self.dense = DenseRetriever(corpus, embedding_model, candidates, device, batch_size, index_dir,
+                                    dtype=dtype, search_device=search_device)
+        try:
+            self.reranker = QwenReranker(
+                reranker_model,
+                device=device,
+                dtype=dtype,
+                batch_size=batch_size,
+                max_length=max_length,
+                max_batch_tokens=max_batch_tokens,
+                truncation=truncation,
+                instruction=instruction,
+            )
+        except BaseException:
+            self.dense.close()
+            raise
+        self.local_search_device = self.dense.local_search_device
+        self.runtime_metadata = {**self.dense.runtime_metadata, 'reranker_model': reranker_model,
+                                 'reranker_device': device, 'reranker_dtype': dtype}
 
     def reset(self):
         self.dense.reset()
+
+    def close(self):
+        try:
+            self.dense.close()
+        finally:
+            self.reranker.close()
 
     def retrieve(self, query) -> RetrievalResult:
         synchronize()
@@ -205,8 +226,9 @@ class DenseRerankRetriever:
         order = sorted(range(len(scores)), key=lambda i: (-scores[i], i))[: self.top_k]
         synchronize()
         elapsed = time.perf_counter() - start
-        stages = [
-            {"stage": "dense", "candidates": len(dense.ids), "latency_seconds": dense_elapsed},
+        stages = (dense.stages or [
+            {"stage": "dense", "candidates": len(dense.ids), "latency_seconds": dense_elapsed}
+        ]) + [
             {
                 "stage": "pointwise_rerank",
                 "candidates": len(dense.ids),

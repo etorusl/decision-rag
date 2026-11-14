@@ -125,6 +125,7 @@ def _evaluate(retriever, queries, output, *, warmup, config, source_paths, dedup
                 key = key.lower()
             canonical[p.id] = hashlib.sha256(key.encode()).hexdigest()
     metrics, latencies = [], []
+    component_times = {}
     total_latency, recall_sum, labeled = 0.0, 0.0, 0
     work = {key: 0 for key in ("input_tokens", "forward_passes", "requests")}
     from .telemetry import GPUMonitor
@@ -155,6 +156,10 @@ def _evaluate(retriever, queries, output, *, warmup, config, source_paths, dedup
             metrics.append(measured)
             latencies.append(elapsed)
             for stage in result.stages:
+                for component in ('query_embedding', 'vector_search'):
+                    value = stage.get(component + '_seconds')
+                    if value is not None:
+                        component_times.setdefault(component, []).append(value)
                 for key in ("prompt_requests", "completion_tokens", "cached_tokens"):
                     if key in stage:
                         work.setdefault(key, 0)
@@ -170,6 +175,11 @@ def _evaluate(retriever, queries, output, *, warmup, config, source_paths, dedup
             reporter.event('query_complete', console=False, query_index=query_index, query_id=query.id,
                            latency_seconds=elapsed, metrics=measured)
             phase.update(**progress_metrics)
+    local_search_device = getattr(retriever, 'local_search_device', None)
+    process = 'benchmark_process'
+    if external:
+        process = ('external_vllm_server_and_local_gpu_search' if str(local_search_device).startswith('cuda')
+                   else 'external_vllm_server')
     summary = {"quality": aggregate(metrics), "labeled_queries": sum(bool(m) for m in metrics),
                "unlabeled_queries": sum(not bool(m) for m in metrics),
                "latency": latency_summary(latencies), "warmup_queries": min(warmup, len(queries)),
@@ -181,7 +191,9 @@ def _evaluate(retriever, queries, output, *, warmup, config, source_paths, dedup
                "environment": environment(), "config": config or {},
                "inputs": {str(p): file_hash(p) for p in source_paths},
                "work": work,
-               "inference_process": "external_vllm_server" if external else "benchmark_process",
+               "component_latency": {name: latency_summary(values) for name, values in component_times.items()},
+               "local_search_device": local_search_device,
+               "inference_process": process,
                "gpu_telemetry": monitor.summary()}
     if not external and 'torch' in sys.modules:
         import torch

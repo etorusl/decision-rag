@@ -141,6 +141,8 @@ def main(argv=None):
     parser.add_argument('--pool-max-model-len', type=int, default=8192)
     parser.add_argument('--pool-memory', type=float, default=.40)
     parser.add_argument('--decision-memory', type=float, default=.85)
+    parser.add_argument('--search-device', choices=['cuda', 'cpu'], default='cuda',
+                        help='Dense/BM25 search device; CUDA uses the same selected GPU as vLLM')
     parser.add_argument('--gpu-index', default=os.getenv('DECISION_RAG_GPU_INDEX') or '1',
                         help='Single GPU index for CUDA_VISIBLE_DEVICES and nvidia-smi monitoring (default: 1)')
     parser.add_argument('--startup-timeout', type=float, default=1200)
@@ -167,6 +169,7 @@ def main(argv=None):
                      name='benchmark-suite') as reporter:
         reporter.event('suite_started', f'Benchmark suite: {args.dataset}; logs: {run_dir}',
                        dataset=args.dataset, limit=args.limit, gpu_index=args.gpu_index,
+                       search_device=args.search_device,
                        benchmarks=7 if args.ablations else 5, output=str(run_dir))
         run_suite(args, executable, run_dir, reporter)
     print(f'Results: {run_dir}')
@@ -205,11 +208,12 @@ def run_suite(args, executable, run_dir, reporter):
                        benchmark=name, completed=completed, total=total,
                        benchmark_seconds=time.monotonic() - started)
     if not args.ablations:
-        benchmark('bm25', ['--method', 'bm25'])
+        benchmark('bm25', ['--method', 'bm25', '--search-device', args.search_device])
         with Servers(run_dir / 'servers', executable, args.startup_timeout, args.gpu_index, reporter) as servers:
             embedding_url = servers.start(args.embedding_model, revisions[args.embedding_model], args.port_base + 1,
                                           'embedding', args.pool_memory, args.pool_max_model_len)
             dense = ['--engine', 'vllm', '--model', args.embedding_model, '--embedding-url', embedding_url,
+                     '--search-device', args.search_device,
                      '--embedding-revision', revisions[args.embedding_model], '--index-dir',
                      f'cache/vllm-dense/{args.dataset}/{args.embedding_model.replace("/", "_")}-{revisions[args.embedding_model]}']
             benchmark('dense-vllm', ['--method', 'dense', *dense])

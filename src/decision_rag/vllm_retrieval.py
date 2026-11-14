@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 import httpx
 import numpy as np
 
+from .dense_search import ExactDenseIndex, resolve_search_device
 from .retrieval import RetrievalResult
 
 EMBED_QUERY_PREFIX = "Instruct: Given a question, retrieve passages that answer it\nQuery: "
@@ -118,7 +119,7 @@ class VLLMDenseRetriever:
     def __init__(self, corpus, model_name="Qwen/Qwen3-Embedding-8B", *,
                  base_url="http://127.0.0.1:8001", top_k=20, batch_size=16,
                  index_dir=None, revision=None, timeout=120, client=None,
-                 dtype="bfloat16", quantization=None, reporter=None):
+                 dtype="bfloat16", quantization=None, reporter=None, search_device='cuda'):
         if min(top_k, batch_size) <= 0:
             raise ValueError("top_k and batch_size must be positive")
         if not corpus.passages:
@@ -128,10 +129,11 @@ class VLLMDenseRetriever:
             raise ValueError("Persistent vLLM index requires an immutable revision: HF commit SHA or sha256:...")
         self.corpus, self.passages = corpus, corpus.passages
         self.top_k, self.batch_size = top_k, batch_size
+        self.local_search_device = resolve_search_device(search_device)
         self.server = _PoolingServer(base_url, model_name, revision=revision, timeout=timeout, client=client)
         self.model_name = model_name
         self.runtime_metadata = {"engine": "vllm-http", "embedding": self.server.metadata,
-                                 "search": "CPU exact dot product of normalized embeddings",
+                                 "search": "Exact dot product of normalized embeddings",
                                  "forward_passes": "not observable through HTTP",
                                  "truncation": "none; overlength requests fail",
                                  "declared_dtype": dtype, "declared_quantization": quantization,
@@ -196,6 +198,21 @@ class VLLMDenseRetriever:
                 self.embeddings = np.concatenate(chunks)
         self.runtime_metadata["index_cache_reused"] = not bool(self.indexing_usage)
         self.runtime_metadata["indexing_usage"] = _merge_usage(self.indexing_usage)
+        phase = reporter.phase('Load search index', total=1, unit='index', device=self.local_search_device) if reporter else nullcontext()
+        self.search_index = None
+        try:
+            with phase as progress:
+                self.search_index = ExactDenseIndex(self.embeddings, device=self.local_search_device)
+                if progress:
+                    progress.update(index_bytes=self.search_index.metadata['index_bytes'])
+        except BaseException:
+            try:
+                if self.search_index is not None:
+                    self.search_index.close()
+            finally:
+                self.server.close()
+            raise
+        self.runtime_metadata['search_runtime'] = self.search_index.metadata
 
     def _document_text(self, text):
         return "passage: " + text if "e5" in self.model_name.lower() else text
@@ -226,18 +243,22 @@ class VLLMDenseRetriever:
         pass
 
     def close(self):
-        self.server.close()
+        try:
+            self.search_index.close()
+        finally:
+            self.server.close()
 
     def retrieve(self, query):
         start = time.perf_counter()
         vectors, usage = self._embed([self._query_text(query.context())])
-        if vectors.shape[1] != self.embeddings.shape[1]:
-            raise ValueError("Query embedding dimension differs from the corpus index")
-        scores = self.embeddings @ vectors[0]
-        ranking = np.argsort(-scores, kind="stable")[:self.top_k]
+        embedding_seconds = time.perf_counter() - start
+        search_start = time.perf_counter()
+        ranking, scores = self.search_index.search(vectors[0], self.top_k)
+        search_seconds = time.perf_counter() - search_start
         elapsed = time.perf_counter() - start
-        stage = {"stage": "dense", "seconds": elapsed, "candidates": len(self.passages), **usage}
-        return RetrievalResult(query.id, [self.passages[i].id for i in ranking], scores[ranking].tolist(),
+        stage = {"stage": "dense", "seconds": elapsed, "candidates": len(self.passages),
+                 "query_embedding_seconds": embedding_seconds, "vector_search_seconds": search_seconds, **usage}
+        return RetrievalResult(query.id, [self.passages[i].id for i in ranking], scores.tolist(),
                                elapsed, [stage])
 
 
@@ -283,17 +304,24 @@ class VLLMDenseRerankRetriever:
                  embedding_base_url="http://127.0.0.1:8001", reranker_base_url="http://127.0.0.1:8002",
                  top_k=20, candidates=100, batch_size=16, index_dir=None,
                  embedding_revision=None, reranker_revision=None, timeout=120,
-                 embedding_client=None, reranker_client=None, dtype="bfloat16", quantization=None, reporter=None):
+                 embedding_client=None, reranker_client=None, dtype="bfloat16", quantization=None, reporter=None,
+                 search_device='cuda'):
         if top_k <= 0 or candidates < top_k:
             raise ValueError("Require 0 < top_k <= candidates")
         self.corpus, self.top_k = corpus, top_k
         self.dense = VLLMDenseRetriever(corpus, embedding_model, base_url=embedding_base_url,
                                        top_k=candidates, batch_size=batch_size, index_dir=index_dir,
                                        revision=embedding_revision, timeout=timeout, client=embedding_client,
-                                       dtype=dtype, quantization=quantization, reporter=reporter)
-        self.reranker = VLLMQwenReranker(reranker_model, base_url=reranker_base_url,
-                                        batch_size=batch_size, revision=reranker_revision,
-                                        timeout=timeout, client=reranker_client)
+                                       dtype=dtype, quantization=quantization, reporter=reporter,
+                                       search_device=search_device)
+        self.local_search_device = self.dense.local_search_device
+        try:
+            self.reranker = VLLMQwenReranker(reranker_model, base_url=reranker_base_url,
+                                            batch_size=batch_size, revision=reranker_revision,
+                                            timeout=timeout, client=reranker_client)
+        except BaseException:
+            self.dense.close()
+            raise
         self.runtime_metadata = {**self.dense.runtime_metadata, "reranker": self.reranker.server.metadata,
                                  "timing_scope": "live query embedding + exact search + live reranking"}
 
@@ -301,8 +329,10 @@ class VLLMDenseRerankRetriever:
         self.dense.reset()
 
     def close(self):
-        self.dense.close()
-        self.reranker.close()
+        try:
+            self.dense.close()
+        finally:
+            self.reranker.close()
 
     def retrieve(self, query):
         start = time.perf_counter()
