@@ -2,13 +2,16 @@
 
 These inference adapters call local vLLM HTTP servers. They load no model weights into
 the benchmark process and do not import the training backend. The supported reference
-configuration is **vLLM 0.11.2** with official Qwen3 Embedding and Reranker weights.
+configuration is **vLLM 0.11.2** with official Qwen3 Embedding/Reranker and BGE-M3 weights.
 
 ## Servers on one H100
 
 Run the servers in the separate vLLM environment created by the repository's inference
 setup. Pin each model with its immutable Hugging Face commit using `--revision` and
 `--tokenizer-revision`; the benchmark must receive the same revision strings.
+The suite's `scripts/download_models.py` downloads all five models before inference and
+writes `cache/model-manifest.json`; pass it to the runner with `--model-manifest` to use
+the verified cached revisions offline. The full seven-run sequence is in [the runbook](run-benchmarks.md).
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-Embedding-8B \
@@ -44,6 +47,16 @@ classification head. This is inference-only conversion of existing weights, not 
 The client supplies the original query/instruction prefix and document/assistant suffix,
 then calls `/score` with `use_activation=true`. Supplying unformatted query/document pairs
 would change the model's prompt and is not done here.
+
+The additional BGE pair uses native vLLM `XLMRobertaModel` and
+`XLMRobertaForSequenceClassification` implementations. Both use CLS pooling; BGE-M3 produces
+normalized dense embeddings without a query instruction. The BGE reranker receives the
+plain query/document pair through `/score`, with sigmoid activation. It does not use the
+Qwen chat prompt or Qwen architecture overrides. The suite disables chunked prefill and
+prefix caching for the BGE servers and keeps their context limit at 8192 tokens.
+Only the dense output of BGE-M3 is evaluated, not its sparse or ColBERT outputs.
+Qwen and BGE server pairs run sequentially on GPU 1 and use separate model/revision index
+caches and separate logs. Qwen configurations remain unchanged.
 
 ## Measurement and index identity
 
@@ -89,8 +102,10 @@ launch setting, so the launcher configuration is part of experiment provenance.
 
 Inputs are never silently truncated. If a query/document pair or embedding input exceeds
 the server's configured context length, vLLM returns an error and the benchmark stops.
-Increase `--max-model-len` after measuring memory or define and report an explicit
+For Qwen, increase `--max-model-len` after measuring memory or define and report an explicit
 preprocessing policy. Server HTTP failures do not trigger a hidden Transformers fallback.
+BGE-M3 and its reranker are limited to 8192 tokens; a longer Qwen limit does not increase
+the separate BGE limit.
 
 ## Verified primary references
 
@@ -99,3 +114,6 @@ preprocessing policy. Server HTTP failures do not trigger a hidden Transformers 
 - [Official original-Qwen3-reranker conversion and pair prompt](https://github.com/vllm-project/vllm/blob/v0.11.2/examples/offline_inference/pooling/qwen3_reranker.py).
 - [Score protocol and response schemas](https://github.com/vllm-project/vllm/blob/v0.11.2/vllm/entrypoints/openai/protocol.py).
 - [Score prompt concatenation](https://github.com/vllm-project/vllm/blob/v0.11.2/vllm/entrypoints/score_utils.py).
+- [Official BGE-M3 model card](https://huggingface.co/BAAI/bge-m3).
+- [Official BGE reranker model card](https://huggingface.co/BAAI/bge-reranker-v2-m3).
+- [Pinned vLLM RoBERTa/XLM-R implementations and CLS pooling](https://github.com/vllm-project/vllm/blob/v0.11.2/vllm/model_executor/models/roberta.py).

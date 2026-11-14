@@ -112,3 +112,108 @@ def test_reporter_handles_missing_fields_and_invalid_input(tmp_path):
     path.write_text("{}")
     with pytest.raises(ValueError, match="Not an evaluation"):
         reporter.flatten_summary(path)
+
+
+@pytest.mark.parametrize('choice_k,run_type', [(0, 'naive binary'), (20, 'naive choice')])
+def test_decision_rows_include_actual_model_in_every_table_and_csv(tmp_path, choice_k, run_type):
+    source = write_summary(tmp_path / 'pages-3')
+    summary = json.loads(source.read_text())
+    summary['config'] = {
+        'method': 'decision', 'backend': 'vllm-logits:Qwen/Qwen3-8B',
+        'model': 'Qwen/Qwen3-8B', 'model_revision': 'a' * 40,
+        'retrieval': {'choice_k': choice_k, 'page_budget': 3},
+        'args': {'backend': 'vllm', 'model': 'unused-user-alias', 'choice_k': 0},
+        'runtime': {'model': 'Qwen/Qwen3-8B', 'runtime': 'vllm-http'},
+    }
+    source.write_text(json.dumps(summary))
+    row = reporter.flatten_summary(source)
+    assert row['run_type'] == run_type
+    assert row['model'] == 'Qwen/Qwen3-8B'
+    assert row['model_revision'] == 'a' * 40
+    assert row['embedding_model'] == row['reranker_model'] == ''
+    markdown = reporter.markdown_text([row])
+    for table in ('Quality', 'Efficiency', 'Protocol'):
+        section = markdown.split(f'## {table}\n', 1)[1].split('\n## ', 1)[0]
+        assert f'{run_type} — Qwen/Qwen3-8B' in section
+        assert f'[{source.parent.parent.name}/pages-3]' in section
+    assert f'R1: `{source.parent}`' in markdown
+    exported = next(csv.DictReader(io.StringIO(reporter.csv_text([row]))))
+    assert exported['model'] == 'Qwen/Qwen3-8B'
+    assert exported['run_type'] == run_type
+    assert exported['run'] == str(source.parent)
+
+
+@pytest.mark.parametrize('embedding,reranker', [
+    ('Qwen/Qwen3-Embedding-8B', 'Qwen/Qwen3-Reranker-8B'),
+    ('BAAI/bge-m3', 'BAAI/bge-reranker-v2-m3'),
+])
+@pytest.mark.parametrize('method', ['dense', 'dense-rerank'])
+def test_dense_rows_name_used_embedder_and_reranker(tmp_path, embedding, reranker, method):
+    source = write_summary(tmp_path / 'dense-run')
+    summary = json.loads(source.read_text())
+    summary['config'] = {
+        'method': method, 'engine': 'vllm', 'model': embedding,
+        # This CLI default exists for pure dense too; it must not appear as a used model.
+        'reranker_model': reranker,
+        'runtime': {'embedding': {'model': embedding, 'revision': 'e' * 40}},
+    }
+    if method == 'dense-rerank':
+        summary['config']['runtime']['reranker'] = {'model': reranker, 'revision': 'f' * 40}
+    source.write_text(json.dumps(summary))
+    row = reporter.flatten_summary(source)
+    assert row['embedding_model'] == embedding
+    assert row['embedding_revision'] == 'e' * 40
+    assert row['model'] == ''
+    markdown = reporter.markdown_text([row])
+    for table in ('Quality', 'Efficiency', 'Protocol'):
+        section = markdown.split(f'## {table}\n', 1)[1].split('\n## ', 1)[0]
+        assert f'embedder: {embedding}' in section
+        assert f'reranker: {reranker if method == "dense-rerank" else "none"}' in section
+    if method == 'dense':
+        assert row['reranker_model'] == row['reranker_revision'] == ''
+        assert reranker not in markdown
+    else:
+        assert row['reranker_model'] == reranker
+        assert row['reranker_revision'] == 'f' * 40
+    exported = next(csv.DictReader(io.StringIO(reporter.csv_text([row]))))
+    assert exported['embedding_model'] == embedding
+    assert exported['reranker_model'] == (reranker if method == 'dense-rerank' else '')
+
+
+def test_hf_runtime_models_and_trained_head_checkpoint_are_preserved():
+    dense = reporter.model_identity({
+        'method': 'dense-rerank', 'runtime': {'engine': 'sentence-transformers',
+            'embedding_model': 'custom/embedder', 'embedding_revision': 'embedding-sha',
+            'reranker_model': 'custom/reranker'},
+    })
+    assert dense['embedding_model'] == 'custom/embedder'
+    assert dense['reranker_model'] == 'custom/reranker'
+    assert dense['embedding_revision'] == 'embedding-sha'
+    head = reporter.model_identity({
+        'method': 'decision', 'backend': 'trained-decision-head:md2d',
+        'model': 'Qwen/Qwen3-8B-Base', 'model_revision': 'base-sha', 'checkpoint': 'checkpoints/md2d',
+        'retrieval': {'choice_k': 0}, 'args': {'backend': 'head', 'model': 'unused-model'},
+    })
+    assert head['run_label'] == 'trained head binary — Qwen/Qwen3-8B-Base; checkpoint: checkpoints/md2d'
+    assert head['model_revision'] == 'base-sha'
+    assert head['checkpoint'] == 'checkpoints/md2d'
+    legacy_head = reporter.model_identity({
+        'method': 'decision', 'backend': 'trained-decision-head:md2d',
+        'args': {'backend': 'head', 'model': 'ignored-by-head-loader', 'checkpoint': 'checkpoints/md2d'},
+    })
+    assert legacy_head['model'] == ''
+    assert 'model unknown' in legacy_head['run_label']
+    assert 'ignored-by-head-loader' not in legacy_head['run_label']
+
+
+def test_bm25_and_unknown_runs_do_not_claim_unused_neural_models(tmp_path):
+    bm25 = reporter.model_identity({'method': 'bm25', 'model': 'unused', 'reranker_model': 'unused-reranker'})
+    assert bm25['run_label'] == 'BM25 — no neural model'
+    assert bm25['model'] == bm25['embedding_model'] == bm25['reranker_model'] == ''
+    source = write_summary(tmp_path / 'naive-binary-Qwen-Qwen3-8B')
+    row = reporter.flatten_summary(source)
+    assert row['model'] == '' and row['method'] == 'unknown'
+    assert row['run_label'] == 'unknown — model unknown'
+    legacy = reporter.model_identity({'backend': 'hf-logits:org/archived-model'})
+    assert legacy['model'] == 'org/archived-model'
+    assert legacy['run_type'] == 'naive'

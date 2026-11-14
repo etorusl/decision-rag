@@ -4,7 +4,7 @@
 ([arXiv:2610.35868](https://arxiv.org/abs/2610.35868)). Основной сценарий — одна **H100 80 GB**, без внешнего API.
 
 **Бенчмаркинг готовых моделей использует локальный vLLM, только inference.**
-Qwen3, Qwen3-Embedding и Qwen3-Reranker запускаются как localhost-серверы на H100.
+Qwen3, Qwen3-Embedding, Qwen3-Reranker и дополнительная пара BGE-M3 запускаются как localhost-серверы на H100.
 Обучение собственной head — отдельный эксперимент.
 
 Реализованы два подхода:
@@ -29,18 +29,23 @@ git clone git@github.com:etorusl/decision-rag.git
 cd decision-rag
 bash scripts/setup_vllm_h100.sh
 source .venv-vllm/bin/activate
+python scripts/download_models.py --manifest cache/model-manifest.json
 
-# Пять систем, первые 100 запросов, полный корпус:
-# BM25 / dense / dense+reranker / naive binary / naive+choice
-bash scripts/benchmark_h100.sh multidoc2dial 100
+# Семь систем, первые 100 запросов, полный корпус:
+# BM25 / Qwen dense и dense+reranker / BGE dense и dense+reranker / naive binary и choice
+bash scripts/benchmark_h100.sh multidoc2dial 100 --model-manifest cache/model-manifest.json
 
 # Полные бенчмарки без обучения
-bash scripts/benchmark_h100.sh multidoc2dial all
-bash scripts/benchmark_h100.sh conditionalqa all
+bash scripts/benchmark_h100.sh multidoc2dial all --model-manifest cache/model-manifest.json
+bash scripts/benchmark_h100.sh conditionalqa all --model-manifest cache/model-manifest.json
 ```
 
 Сначала запускайте короткую выборку. Скрипт сам поднимает и останавливает локальные vLLM-серверы;
 для готовых моделей training-этапа нет. Установка vLLM изолирована в `.venv-vllm`.
+Предварительное скачивание фиксирует SHA и проверяет файлы всех пяти моделей. С manifest
+модельные процессы используют локальный HF cache без сети; данные скачиваются отдельно.
+Исходные Qwen-прогоны сохранены, к ним добавлены `BAAI/bge-m3` и
+`BAAI/bge-reranker-v2-m3`. В каждой строке отчёта указаны тип прогона и фактические модели.
 Dense-поиск и top-k по умолчанию выполняются на GPU вместе с embedding/reranker;
 FP32-индекс переносится туда один раз при инициализации. Устройство поиска и время
 query embedding / vector search записываются в результаты; CPU-поиск требует явного `--search-device cpu`.
@@ -48,6 +53,7 @@ BM25 scoring и top-k также используют GPU; текстовая п
 Для другой GPU задайте `DECISION_RAG_GPU_INDEX=N`; в benchmark runner также доступен `--gpu-index N`.
 H100 memory/latency и качество больших моделей **ещё не измерены** на машине разработки.
 Подробные команды, параметры и обработка OOM: [инструкция vLLM](docs/vllm.md).
+Полная последовательность скачивания, smoke/full-прогонов и отчёта: [команды запуска](docs/run-benchmarks.md).
 
 ## Бенчмарки
 
@@ -85,11 +91,11 @@ MTRAG использует официальные gold labels: расширен�
 python scripts/summarize_runs.py results
 
 # Разность качества и paired bootstrap CI с пересэмплированием целых диалогов
-decision-rag compare results/RUN/multidoc2dial/naive-binary \
-  results/RUN/multidoc2dial/dense-rerank --metric recall@1
+decision-rag compare results/RUN/multidoc2dial/naive-binary-vllm \
+  results/RUN/multidoc2dial/dense-rerank-vllm --metric recall@1
 
 # Бюджет страниц, размер общего контекста, отключение памяти
-bash scripts/ablate_h100.sh multidoc2dial 100
+bash scripts/ablate_h100.sh multidoc2dial 100 --model-manifest cache/model-manifest.json
 ```
 
 ## Обучение собственной модели отдельно

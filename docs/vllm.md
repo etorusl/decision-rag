@@ -1,16 +1,20 @@
 # Готовые модели: локальный vLLM, только inference
 
 Основной benchmarking-путь использует **vLLM 0.11.2** и готовые Hugging Face checkpoints:
-Qwen3-8B, Qwen3-Embedding-8B, Qwen3-Reranker-8B. Обучение, LoRA и подготовка training data
+Qwen3-8B, Qwen3-Embedding-8B, Qwen3-Reranker-8B, BAAI/bge-m3 и BAAI/bge-reranker-v2-m3.
+Обучение, LoRA и подготовка training data
 для этих запусков не нужны. Версия зафиксирована по проверенным API; это не требование
 использовать «самую новую» версию vLLM.
 
 ## Запуск на одной H100 80 GB
 
+Полная последовательность команд от установки до итогового отчёта: [run-benchmarks.md](run-benchmarks.md).
+
 ```bash
 git pull
 bash scripts/setup_vllm_h100.sh
-bash scripts/benchmark_h100.sh multidoc2dial 100
+.venv-vllm/bin/python scripts/download_models.py --manifest cache/model-manifest.json
+bash scripts/benchmark_h100.sh multidoc2dial 100 --model-manifest cache/model-manifest.json
 ```
 
 По умолчанию скрипты используют физическую **GPU 1**: серверы vLLM получают
@@ -21,42 +25,68 @@ bash scripts/benchmark_h100.sh multidoc2dial 100
 Нужны Linux, Python 3.12 и NVIDIA driver, совместимый с CUDA 12.8. Создаётся отдельное
 окружение `.venv-vllm`: vLLM 0.11.2 использует PyTorch 2.9.0, а training-окружение проекта
 фиксирует 2.7.1. Не устанавливайте `constraints-h100.txt` или `.[local]` в `.venv-vllm`.
-Установка не загружает model weights; они скачиваются при запуске серверов.
+Установка не загружает model weights. Отдельный `download_models.py` скачивает все пять
+checkpoints до запуска эксперимента и записывает immutable revisions, каталог HF cache
+и список файлов в manifest. Повторный вызов сохраняет прежние SHA; `--refresh` явно
+обновляет их. С `--model-manifest` runner проверяет наличие файлов и запускает модели
+с `HF_HUB_OFFLINE=1` и `TRANSFORMERS_OFFLINE=1`; подготовка датасета остаётся сетевой.
+Без manifest сохранён прежний режим разрешения revisions через Hugging Face.
 
 Скрипт автоматически:
 
 1. Подготавливает полный корпус и выбранное число evaluation queries.
-2. Фиксирует Hugging Face revision SHA для каждой модели и запускает сервер с этим SHA.
+2. Использует проверенные Hugging Face revision SHA из manifest и запускает серверы с этими SHA.
 3. Измеряет BM25: численный scoring и top-k выполняются на GPU.
 4. Запускает embedding server на `127.0.0.1:8001` с бюджетом 40% VRAM; измеряет dense с поиском на GPU.
 5. Запускает reranker server на `127.0.0.1:8002` с ещё 40%; измеряет live dense → reranker.
-6. Останавливает оба своих сервера и запускает Qwen3 на `127.0.0.1:8000` с 85% VRAM.
-7. Измеряет DecisionRAG без обучения, с binary scoring и с дополнительным choice reranking.
-8. Останавливает свой сервер и сохраняет CSV/Markdown-сводку.
+6. Останавливает оба Qwen pooling-сервера; на тех же портах последовательно запускает
+   BGE-M3 embedding и BGE reranker, измеряет ещё dense и dense → reranker, затем освобождает их.
+7. Запускает Qwen3 на `127.0.0.1:8000` с 85% VRAM и измеряет DecisionRAG без обучения:
+   binary scoring и дополнительный choice reranking.
+8. Останавливает свой сервер и сохраняет CSV/Markdown-сводку с моделями в каждой строке.
+
+| Прогон | Модель / эмбеддер | Реранкер |
+|---|---|---|
+| BM25 | BM25 | — |
+| Dense | Qwen/Qwen3-Embedding-8B | — |
+| Dense + rerank | Qwen/Qwen3-Embedding-8B | Qwen/Qwen3-Reranker-8B |
+| Dense | BAAI/bge-m3 | — |
+| Dense + rerank | BAAI/bge-m3 | BAAI/bge-reranker-v2-m3 |
+| Naive binary | Qwen/Qwen3-8B | — |
+| Naive choice | Qwen/Qwen3-8B | выбор через ту же Qwen/Qwen3-8B |
+
+Исходные пять вариантов и их параметры сохранены. `--skip-bge` возвращает исходную матрицу;
+по умолчанию выполняются все семь. Дополнительные BGE-прогоны используют dense-векторы BGE-M3,
+без sparse/ColBERT-гибрида и без смешивания эмбеддеров и реранкеров разных семейств.
 
 Скрипт не завершает чужие процессы: занятый порт приводит к явной ошибке. Логи и точные
 команды серверов находятся в `results/RUN/DATASET/servers/`, revisions — в `server-config.json`.
+BGE server logs находятся в `servers/bge/` и не перезаписывают Qwen logs.
 Повторный run tag не перезаписывается. Для другой группы портов добавьте `--port-base 8100`.
 
 ```bash
-bash scripts/benchmark_h100.sh multidoc2dial all
-bash scripts/benchmark_h100.sh conditionalqa all
-bash scripts/benchmark_h100.sh scifact all
-bash scripts/benchmark_h100.sh mtrag all
+bash scripts/benchmark_h100.sh multidoc2dial all --model-manifest cache/model-manifest.json
+bash scripts/benchmark_h100.sh conditionalqa all --model-manifest cache/model-manifest.json
+bash scripts/benchmark_h100.sh scifact all --model-manifest cache/model-manifest.json
+bash scripts/benchmark_h100.sh mtrag all --model-manifest cache/model-manifest.json
 
-# Быстрая диагностика на готовых 0.6B checkpoints
+# Необязательная отдельная диагностика на готовых Qwen 0.6B checkpoints
+.venv-vllm/bin/python scripts/download_models.py --skip-bge --manifest cache/small-model-manifest.json \
+  --naive-model Qwen/Qwen3-0.6B --embedding-model Qwen/Qwen3-Embedding-0.6B \
+  --reranker-model Qwen/Qwen3-Reranker-0.6B
 NAIVE_MODEL=Qwen/Qwen3-0.6B \
 EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B \
 RERANKER_MODEL=Qwen/Qwen3-Reranker-0.6B \
-bash scripts/benchmark_h100.sh multidoc2dial 20
+bash scripts/benchmark_h100.sh multidoc2dial 20 --skip-bge --model-manifest cache/small-model-manifest.json
 
 # Бюджеты страниц, размер shared context и память диалога
-bash scripts/ablate_h100.sh multidoc2dial 100
+bash scripts/ablate_h100.sh multidoc2dial 100 --model-manifest cache/model-manifest.json
 ```
 
 `100` ограничивает запросы, не корпус. Для запросов длиннее pooling limit скрипт завершится
-ошибкой без скрытого truncation; можно повысить `--pool-max-model-len 16384` после проверки
-памяти. Основная модель имеет `--max-model-len 32768`; локальная разбивка кандидатов учитывает
+ошибкой без скрытого truncation. Для Qwen можно повысить `--pool-max-model-len 16384` после проверки
+памяти; BGE имеет отдельный `--bge-max-model-len 8192`, максимум 8192 для этих checkpoints.
+Основная модель имеет `--max-model-len 32768`; локальная разбивка кандидатов учитывает
 этот предел. Бюджет VRAM сервера — предварительное резервирование, не измеренный минимум.
 
 ## Подключение к своему уже запущенному vLLM
@@ -142,13 +172,14 @@ CSV/Markdown-сводка отдельно показывает устройст
 ## Прогресс и логи
 
 В терминале автоматически появляются progress bars прогрева и запросов: выполнено/всего,
-скорость, elapsed/ETA и текущие метрики. Runner сообщает, какой из пяти бенчмарков
-(семи для абляций) выполняется, и показывает ожидание запуска vLLM с путём к server log.
+скорость, elapsed/ETA и текущие метрики. Runner сообщает, какой из семи бенчмарков
+выполняется и какие модели используются, и показывает ожидание запуска vLLM с путём к server log.
 Общая ETA для разных методов не вычисляется: их скорость различается.
 
 В `results/<RUN_TAG>/<dataset>/` сохраняются `run.log` и `events.jsonl` всего прогона;
 в каталоге каждого метода — собственные `run.log`, `events.jsonl`, `queries.jsonl` и `summary.json`.
-Traceback при ошибке остаётся в логах. stdout/stderr серверов vLLM находятся в `servers/*.log`.
+Traceback при ошибке остаётся в логах. stdout/stderr серверов vLLM находятся в `servers/*.log`
+и `servers/bge/*.log`.
 Логирование и обновление progress bar выполняются вне измеряемого retrieval-интервала.
 
 `--progress auto` — значение по умолчанию; `on` принудительно включает bars,
@@ -157,12 +188,14 @@ Traceback при ошибке остаётся в логах. stdout/stderr се
 Интервал задаёт `--log-interval`; те же параметры доступны у `decision-rag benchmark`.
 
 ```bash
-bash scripts/benchmark_h100.sh multidoc2dial 100 --progress auto --log-interval 10
+bash scripts/benchmark_h100.sh multidoc2dial 100 --model-manifest cache/model-manifest.json \
+  --progress auto --log-interval 10
 
 # Запуск после выхода из SSH; каталог results создайте до перенаправления:
 mkdir -p results
 RUN_TAG=md2d-full nohup bash scripts/benchmark_h100.sh multidoc2dial all \
-  --progress off --log-interval 30 > results/md2d-full-console.log 2>&1 &
+  --model-manifest cache/model-manifest.json --progress off --log-interval 30 \
+  > results/md2d-full-console.log 2>&1 &
 tail -f results/md2d-full-console.log
 ```
 

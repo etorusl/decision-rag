@@ -29,6 +29,7 @@ class HFLogitBackend:
     ):
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
+        self.model_name = model_name
         self.attention = resolve_attention(device, attention)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = (

@@ -243,3 +243,21 @@ def test_cli_logs_model_initialization_failure(tmp_path, monkeypatch):
               '--backend', 'smoke', '--progress', 'off'])
     assert 'RuntimeError: model is unavailable' in (tmp_path / 'run/run.log').read_text()
     assert not (tmp_path / 'run/summary.json').exists()
+
+
+def test_cli_trained_head_records_actual_base_model_and_checkpoint(tmp_path, monkeypatch, capsys):
+    from decision_rag.cli import main
+    from decision_rag.demo import SmokeBackend, write_demo
+
+    write_demo(tmp_path / 'data')
+    backend = SmokeBackend()
+    backend.name = 'trained-decision-head:example'
+    backend.manifest = {'base_model': 'Qwen/Qwen3-8B-Base', 'base_revision': 'a' * 40}
+    monkeypatch.setattr('decision_rag.cli.backend_from_args', lambda args: backend)
+    main(['benchmark', '--corpus', str(tmp_path / 'data/corpus.jsonl'),
+          '--queries', str(tmp_path / 'data/queries.jsonl'), '--output', str(tmp_path / 'run'),
+          '--backend', 'head', '--checkpoint', str(tmp_path / 'checkpoint'), '--progress', 'off'])
+    config = json.loads(capsys.readouterr().out)['config']
+    assert config['model'] == 'Qwen/Qwen3-8B-Base'
+    assert config['model_revision'] == 'a' * 40
+    assert config['checkpoint'] == str(tmp_path / 'checkpoint')

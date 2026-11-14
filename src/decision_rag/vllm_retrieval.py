@@ -32,6 +32,17 @@ RERANK_PREFIX = (
 RERANK_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
 
+def _reranker_family(model_name: str) -> str:
+    name = model_name.lower().rstrip("/").rsplit("/", 1)[-1]
+    if name.startswith("qwen3-reranker-"):
+        return "qwen3"
+    if name == "bge-reranker-v2-m3":
+        return "bge-m3"
+    raise ValueError(
+        f"Unsupported vLLM reranker {model_name!r}; expected Qwen3-Reranker-* or BAAI/bge-reranker-v2-m3"
+    )
+
+
 def _total(values):
     return None if any(value is None for value in values) else sum(values)
 
@@ -132,6 +143,13 @@ class VLLMDenseRetriever:
         self.local_search_device = resolve_search_device(search_device)
         self.server = _PoolingServer(base_url, model_name, revision=revision, timeout=timeout, client=client)
         self.model_name = model_name
+        name = model_name.lower().rstrip("/").rsplit("/", 1)[-1]
+        self.server.metadata.update({
+            "family": "bge-m3" if name == "bge-m3" else (
+                "qwen3" if "qwen3-embedding" in name else "e5" if "e5" in name else "other"),
+            "representation": "dense",
+            "prompt": {"query_prefix": self._query_text(""), "document_prefix": self._document_text("")},
+        })
         self.runtime_metadata = {"engine": "vllm-http", "embedding": self.server.metadata,
                                  "search": "Exact dot product of normalized embeddings",
                                  "forward_passes": "not observable through HTTP",
@@ -262,31 +280,53 @@ class VLLMDenseRetriever:
                                elapsed, [stage])
 
 
-class VLLMQwenReranker:
-    """Official Qwen3 pair prompt + /score on a converted pooling server."""
+class VLLMReranker:
+    """Model-specific pairs for Qwen3 and native BGE-M3 vLLM /score servers."""
 
     def __init__(self, model_name="Qwen/Qwen3-Reranker-8B", *,
                  base_url="http://127.0.0.1:8002", batch_size=16, revision=None,
                  timeout=120, client=None, instruction=RERANK_INSTRUCTION):
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
+        self.family = _reranker_family(model_name)
+        if self.family == "bge-m3" and instruction != RERANK_INSTRUCTION:
+            raise ValueError("BGE-M3 reranking uses raw query/document pairs, without an instruction")
         self.server = _PoolingServer(base_url, model_name, revision=revision, timeout=timeout, client=client)
         self.batch_size, self.model_name, self.instruction = batch_size, model_name, instruction
+        self.server.metadata.update({
+            "family": self.family,
+            "input_format": "qwen3_instruction_pair" if self.family == "qwen3" else "raw_query_document_pair",
+            "prompt": {
+                "instruction": instruction if self.family == "qwen3" else None,
+                "query_template": self._query_text("{query}"),
+                "document_template": self._document_text("{document}"),
+            },
+            "use_activation": True,
+            "score_semantics": "sigmoid relevance score in [0,1]",
+        })
+
+    def _query_text(self, query):
+        if self.family == "qwen3":
+            return f"{RERANK_PREFIX}<Instruct>: {self.instruction}\n<Query>: {query}\n"
+        return query
+
+    def _document_text(self, document):
+        return f"<Document>: {document}{RERANK_SUFFIX}" if self.family == "qwen3" else document
 
     def score(self, query, documents):
         rows, usages = [], []
-        first = f"{RERANK_PREFIX}<Instruct>: {self.instruction}\n<Query>: {query}\n"
+        first = self._query_text(query)
         for start in range(0, len(documents), self.batch_size):
             docs = documents[start:start + self.batch_size]
             data = self.server._request("POST", "/score", {
                 "model": self.model_name, "text_1": first,
-                "text_2": [f"<Document>: {doc}{RERANK_SUFFIX}" for doc in docs],
+                "text_2": [self._document_text(doc) for doc in docs],
                 "use_activation": True})
             result = _ordered_data(data, len(docs))
             values = [row.get("score") for row in result]
-            if any(not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1
+            if any(type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1
                    for value in values):
-                raise ValueError("vLLM Qwen3 /score must return finite probabilities in [0,1]")
+                raise ValueError("vLLM /score must return finite probabilities in [0,1]")
             rows.extend(values)
             usages.append(_usage(data, len(docs)))
         return rows, {**_merge_usage(usages), "truncation_policy": "error (server context limit)",
@@ -294,6 +334,10 @@ class VLLMQwenReranker:
 
     def close(self):
         self.server.close()
+
+
+class VLLMQwenReranker(VLLMReranker):
+    """Backward-compatible name for the Qwen3-default reranker client."""
 
 
 class VLLMDenseRerankRetriever:
@@ -308,6 +352,7 @@ class VLLMDenseRerankRetriever:
                  search_device='cuda'):
         if top_k <= 0 or candidates < top_k:
             raise ValueError("Require 0 < top_k <= candidates")
+        _reranker_family(reranker_model)
         self.corpus, self.top_k = corpus, top_k
         self.dense = VLLMDenseRetriever(corpus, embedding_model, base_url=embedding_base_url,
                                        top_k=candidates, batch_size=batch_size, index_dir=index_dir,
@@ -316,9 +361,9 @@ class VLLMDenseRerankRetriever:
                                        search_device=search_device)
         self.local_search_device = self.dense.local_search_device
         try:
-            self.reranker = VLLMQwenReranker(reranker_model, base_url=reranker_base_url,
-                                            batch_size=batch_size, revision=reranker_revision,
-                                            timeout=timeout, client=reranker_client)
+            self.reranker = VLLMReranker(reranker_model, base_url=reranker_base_url,
+                                        batch_size=batch_size, revision=reranker_revision,
+                                        timeout=timeout, client=reranker_client)
         except BaseException:
             self.dense.close()
             raise

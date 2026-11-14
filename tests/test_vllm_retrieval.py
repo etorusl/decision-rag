@@ -13,10 +13,13 @@ from decision_rag.vllm_retrieval import (
     VLLMDenseRerankRetriever,
     VLLMDenseRetriever,
     VLLMQwenReranker,
+    VLLMReranker,
 )
 
 EMBED_MODEL = "Qwen/Qwen3-Embedding-8B"
 RERANK_MODEL = "Qwen/Qwen3-Reranker-8B"
+BGE_EMBED_MODEL = "BAAI/bge-m3"
+BGE_RERANK_MODEL = "BAAI/bge-reranker-v2-m3"
 REVISION = "a" * 40
 
 
@@ -37,13 +40,13 @@ def pooling_client(model, callback):
     return httpx.Client(transport=httpx.MockTransport(handler))
 
 
-def embeddings_reply(request, calls):
+def embeddings_reply(request, calls, model=EMBED_MODEL):
     assert request.url.path == "/v1/embeddings"
     body = json.loads(request.content)
     calls.append(body)
     values = {"apple": [3, 0], "pear": [1, 1], "banana": [0, 2]}
     rows = [{"index": i, "embedding": values.get(text, [1, 0])} for i, text in enumerate(body["input"])]
-    return httpx.Response(200, json={"model": EMBED_MODEL, "data": rows[::-1],
+    return httpx.Response(200, json={"model": model, "data": rows[::-1],
                                     "usage": {"prompt_tokens": len(rows) * 3}})
 
 
@@ -195,12 +198,70 @@ def test_score_uses_official_prompt_preserves_indices_and_reports_unknown_passes
     assert calls[0]["text_2"] == ["<Document>: A" + RERANK_SUFFIX, "<Document>: B" + RERANK_SUFFIX]
     assert calls[0]["use_activation"] is True
     assert "truncate_prompt_tokens" not in calls[0]
+    assert scorer.server.metadata["family"] == "qwen3"
+    assert scorer.server.metadata["prompt"]["query_template"].replace("{query}", "question") == calls[0]["text_1"]
 
 
-def test_score_errors_do_not_fallback_or_silently_truncate():
+def test_bge_dense_uses_raw_texts_and_live_normalized_embeddings():
+    calls = []
+    client = pooling_client(BGE_EMBED_MODEL, lambda request: embeddings_reply(request, calls, BGE_EMBED_MODEL))
+    dense = VLLMDenseRetriever(corpus(), BGE_EMBED_MODEL, search_device='cpu', client=client, batch_size=2)
+    first = dense.retrieve(Query("q", "where is apple"))
+    dense.retrieve(Query("q", "where is apple"))
+    assert [call["input"] for call in calls] == [["apple", "pear"], ["banana"],
+                                                ["where is apple"], ["where is apple"]]
+    assert all(call["model"] == BGE_EMBED_MODEL for call in calls)
+    assert first.ids == ["p1", "p2", "p3"]
+    np.testing.assert_allclose(np.linalg.norm(dense.embeddings, axis=1), 1)
+    assert dense.runtime_metadata["embedding"]["family"] == "bge-m3"
+    assert dense.runtime_metadata["embedding"]["representation"] == "dense"
+    assert dense.runtime_metadata["embedding"]["prompt"] == {"query_prefix": "", "document_prefix": ""}
+
+
+def test_bge_reranker_sends_raw_pairs_with_activation_and_preserves_usage():
+    calls = []
+    def reply(request):
+        assert request.url.path == "/score"
+        body = json.loads(request.content)
+        calls.append(body)
+        values = [0.2, 0.8][:len(body["text_2"])]
+        return httpx.Response(200, json={"model": BGE_RERANK_MODEL,
+                                        "data": [{"index": i, "score": value} for i, value in enumerate(values)][::-1],
+                                        "usage": {"prompt_tokens": 12}})
+    scorer = VLLMReranker(BGE_RERANK_MODEL, client=pooling_client(BGE_RERANK_MODEL, reply), batch_size=2)
+    scores, usage = scorer.score("question", ["A", "B", "C"])
+    assert scores == [.2, .8, .2]
+    assert calls == [{"model": BGE_RERANK_MODEL, "text_1": "question", "text_2": docs, "use_activation": True}
+                     for docs in [["A", "B"], ["C"]]]
+    assert usage["requests"] == 2
+    assert usage["prompt_requests"] == 3
+    assert usage["input_tokens"] == 24
+    assert usage["forward_passes"] is None
+    assert usage["truncated_candidates"] == 0
+    assert scorer.server.metadata["family"] == "bge-m3"
+    assert scorer.server.metadata["input_format"] == "raw_query_document_pair"
+    assert scorer.server.metadata["prompt"] == {
+        "instruction": None, "query_template": "{query}", "document_template": "{document}"}
+
+
+def test_unknown_reranker_rejected_before_http_or_dense_indexing():
+    client = pooling_client("unknown", lambda request: pytest.fail("Inference must not run"))
+    with pytest.raises(ValueError, match="Unsupported vLLM reranker"):
+        VLLMReranker("unknown", client=client)
+    with pytest.raises(ValueError, match="Unsupported vLLM reranker"):
+        VLLMDenseRerankRetriever(corpus(), reranker_model="unknown", search_device='cpu', embedding_client=client)
+
+
+def test_bge_does_not_silently_ignore_custom_instruction():
+    with pytest.raises(ValueError, match="without an instruction"):
+        VLLMReranker(BGE_RERANK_MODEL, instruction="custom instruction")
+
+
+@pytest.mark.parametrize("model", [RERANK_MODEL, BGE_RERANK_MODEL])
+def test_score_errors_do_not_fallback_or_silently_truncate(model):
     def fail(request):
         return httpx.Response(400, json={"error": {"message": "context too long"}})
-    scorer = VLLMQwenReranker(client=pooling_client(RERANK_MODEL, fail))
+    scorer = VLLMReranker(model, client=pooling_client(model, fail))
     with pytest.raises(RuntimeError, match="context too long"):
         scorer.score("query", ["long doc"])
 
@@ -226,9 +287,34 @@ def test_dense_rerank_includes_live_dense_and_reranker_work():
     assert retriever.runtime_metadata["reranker"]["model"] == RERANK_MODEL
 
 
-def test_invalid_score_probability_is_not_accepted():
+def test_bge_dense_rerank_pipeline_dispatches_raw_pairs_and_labels_both_models():
+    calls = []
+    embedding_client = pooling_client(BGE_EMBED_MODEL, lambda request: embeddings_reply(request, calls, BGE_EMBED_MODEL))
+    def scores(request):
+        body = json.loads(request.content)
+        assert body == {"model": BGE_RERANK_MODEL, "text_1": "apple", "text_2": ["apple", "pear", "banana"],
+                        "use_activation": True}
+        return httpx.Response(200, json={"model": BGE_RERANK_MODEL,
+                                        "data": [{"index": 0, "score": .1}, {"index": 1, "score": .9},
+                                                 {"index": 2, "score": .9}]})
+    retriever = VLLMDenseRerankRetriever(corpus(), BGE_EMBED_MODEL, BGE_RERANK_MODEL,
+                                        search_device='cpu', candidates=3, top_k=2,
+                                        embedding_client=embedding_client,
+                                        reranker_client=pooling_client(BGE_RERANK_MODEL, scores))
+    result = retriever.retrieve(Query("q", "apple"))
+    assert len(calls) == 2
+    assert result.ids == ["p2", "p3"]
+    assert [row["stage"] for row in result.stages] == ["dense", "rerank"]
+    assert result.latency_seconds >= sum(row["seconds"] for row in result.stages)
+    assert retriever.runtime_metadata["embedding"]["model"] == BGE_EMBED_MODEL
+    assert retriever.runtime_metadata["reranker"]["model"] == BGE_RERANK_MODEL
+
+
+@pytest.mark.parametrize("model", [RERANK_MODEL, BGE_RERANK_MODEL])
+@pytest.mark.parametrize("value", [2.0, -0.01, 1e300, True, None, "0.7"])
+def test_invalid_score_probability_is_not_accepted(model, value):
     def bad(request):
-        return httpx.Response(200, json={"data": [{"index": 0, "score": 2.0}]})
-    scorer = VLLMQwenReranker(client=pooling_client(RERANK_MODEL, bad))
+        return httpx.Response(200, json={"data": [{"index": 0, "score": value}]})
+    scorer = VLLMReranker(model, client=pooling_client(model, bad))
     with pytest.raises(ValueError, match="probabilities"):
         scorer.score("q", ["d"])

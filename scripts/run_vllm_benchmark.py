@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -38,17 +39,31 @@ def server_command(executable, model, revision, port, kind, memory, max_model_le
         command += ['--logprobs-mode', 'processed_logprobs', '--max-logprobs', '26', '--enable-prefix-caching']
     else:
         command += ['--no-enable-prefix-caching']
-    if kind == 'reranker':
+        if model.rsplit('/', 1)[-1].lower() in {'bge-m3', 'bge-reranker-v2-m3'}:
+            command += ['--no-enable-chunked-prefill']
+    if kind == 'reranker' and 'qwen3-reranker' in model.lower():
         command += ['--hf-overrides', json.dumps(RERANK_OVERRIDES, separators=(',', ':'))]
     return command
 
 
+def subprocess_environment(gpu_index, model_env=None):
+    env = {**os.environ, 'CUDA_VISIBLE_DEVICES': gpu_index, 'PYTHONUNBUFFERED': '1'}
+    if model_env and 'HF_HUB_CACHE' in model_env:
+        # Transformers 4.x gives these legacy variables priority over HF_HUB_CACHE.
+        for name in ('TRANSFORMERS_CACHE', 'PYTORCH_TRANSFORMERS_CACHE', 'PYTORCH_PRETRAINED_BERT_CACHE'):
+            env.pop(name, None)
+    env.update(model_env or {})
+    return env
+
+
 class Servers:
-    def __init__(self, log_dir, executable, startup_timeout=1200, gpu_index='1', reporter=None):
+    def __init__(self, log_dir, executable, startup_timeout=1200, gpu_index='1', reporter=None,
+                 *, model_env=None):
         self.log_dir, self.executable = Path(log_dir), executable
         self.startup_timeout = startup_timeout
         self.gpu_index = gpu_index
         self.reporter = reporter
+        self.model_env = model_env or {}
         self.processes = []
 
     def start(self, model, revision, port, kind, memory, max_model_len):
@@ -59,8 +74,7 @@ class Servers:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         (self.log_dir / f'{kind}-command.json').write_text(json.dumps(command, indent=2) + '\n')
         log = (self.log_dir / f'{kind}.log').open('w')
-        env = {**os.environ, 'VLLM_USE_V1': '1', 'CUDA_VISIBLE_DEVICES': self.gpu_index,
-               'PYTHONUNBUFFERED': '1'}
+        env = {**subprocess_environment(self.gpu_index, self.model_env), 'VLLM_USE_V1': '1'}
         try:
             process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env,
                                        start_new_session=True)
@@ -136,9 +150,15 @@ def main(argv=None):
     parser.add_argument('--naive-model', default=os.getenv('NAIVE_MODEL', 'Qwen/Qwen3-8B'))
     parser.add_argument('--embedding-model', default=os.getenv('EMBEDDING_MODEL', 'Qwen/Qwen3-Embedding-8B'))
     parser.add_argument('--reranker-model', default=os.getenv('RERANKER_MODEL', 'Qwen/Qwen3-Reranker-8B'))
+    parser.add_argument('--bge-embedding-model', default='BAAI/bge-m3')
+    parser.add_argument('--bge-reranker-model', default='BAAI/bge-reranker-v2-m3')
+    parser.add_argument('--skip-bge', action='store_true', help='Run the original five-method matrix only')
+    parser.add_argument('--model-manifest', help='Manifest from download_models.py; use pinned cached models offline')
     parser.add_argument('--port-base', type=int, default=8000)
     parser.add_argument('--max-model-len', type=int, default=32768)
     parser.add_argument('--pool-max-model-len', type=int, default=8192)
+    parser.add_argument('--bge-max-model-len', type=int, default=8192,
+                        help='BGE pooling context limit, independent of the Qwen limit')
     parser.add_argument('--pool-memory', type=float, default=.40)
     parser.add_argument('--decision-memory', type=float, default=.85)
     parser.add_argument('--search-device', choices=['cuda', 'cpu'], default='cuda',
@@ -154,6 +174,8 @@ def main(argv=None):
         parser.error('limit must be positive or all')
     if not 0 < args.pool_memory < .5 or not 0 < args.decision_memory < 1:
         parser.error('Each pooled server must use <0.5 GPU; decision memory must be between0 and1')
+    if not 1 <= args.bge_max_model_len <= 8192:
+        parser.error('--bge-max-model-len must be between 1 and 8192 for the BGE-M3 checkpoints')
     if args.ablations and args.dataset == 'scifact':
         parser.error('Ablations require a structured paper dataset')
     executable = Path(sys.executable).parent / 'vllm'
@@ -170,25 +192,65 @@ def main(argv=None):
         reporter.event('suite_started', f'Benchmark suite: {args.dataset}; logs: {run_dir}',
                        dataset=args.dataset, limit=args.limit, gpu_index=args.gpu_index,
                        search_device=args.search_device,
-                       benchmarks=7 if args.ablations else 5, output=str(run_dir))
+                       benchmarks=benchmark_count(args), output=str(run_dir))
         run_suite(args, executable, run_dir, reporter)
     print(f'Results: {run_dir}')
 
 
-def run_suite(args, executable, run_dir, reporter):
-    from huggingface_hub import HfApi
-    api = HfApi()
-    models = [args.naive_model] if args.ablations else [args.naive_model, args.embedding_model, args.reranker_model]
+def benchmark_count(args):
+    return 7 if args.ablations or not args.skip_bge else 5
+
+
+def cached_revisions(manifest_path, models):
+    """Validate all requested snapshots before starting any benchmark or server."""
+    manifest = json.loads(Path(manifest_path).read_text())
+    if manifest.get('format_version') != 1 or not isinstance(manifest.get('models'), dict):
+        raise ValueError('Unsupported model manifest; run scripts/download_models.py first')
+    cache = Path(manifest['cache_dir']) if manifest.get('cache_dir') else None
+    if cache is None or not cache.is_absolute() or not cache.is_dir():
+        raise ValueError('Model manifest cache_dir must name the existing absolute HF cache directory')
     revisions = {}
-    with reporter.phase('Resolving model revisions', total=len(set(models)), unit='model') as progress:
-        for model in dict.fromkeys(models):
-            revisions[model] = api.model_info(model).sha
-            progress.update(1, model=model)
+    for model in dict.fromkeys(models):
+        entry = manifest['models'].get(model)
+        if not isinstance(entry, dict) or not re.fullmatch('[0-9a-fA-F]{40}', str(entry.get('revision', ''))):
+            raise ValueError(f'Model manifest lacks an immutable revision for {model}; download it first')
+        snapshot = entry.get('snapshot_path')
+        if not snapshot or not Path(snapshot).is_dir():
+            raise ValueError(f'Cached snapshot for {model} is missing; rerun scripts/download_models.py')
+        expected = cache / ('models--' + model.replace('/', '--')) / 'snapshots' / entry['revision']
+        if Path(snapshot).resolve() != expected.resolve():
+            raise ValueError(f'Manifest snapshot for {model} does not match its cache/model/revision')
+        for filename in entry.get('files', []):
+            relative = Path(filename)
+            if relative.is_absolute() or '..' in relative.parts or not (Path(snapshot) / relative).is_file():
+                raise ValueError(f'Cached file {filename!r} for {model} is missing or invalid; download models again')
+        revisions[model] = entry['revision']
+    model_env = {'HF_HUB_OFFLINE': '1', 'TRANSFORMERS_OFFLINE': '1', 'HF_HUB_CACHE': str(cache)}
+    return revisions, model_env
+
+
+def run_suite(args, executable, run_dir, reporter):
+    models = [args.naive_model] if args.ablations else [args.naive_model, args.embedding_model, args.reranker_model]
+    if not args.ablations and not args.skip_bge:
+        models += [args.bge_embedding_model, args.bge_reranker_model]
+    revisions = {}
+    model_env = {}
+    if args.model_manifest:
+        with reporter.phase('Checking downloaded model snapshots', total=1, unit='manifest') as progress:
+            revisions, model_env = cached_revisions(args.model_manifest, models)
+            progress.update(models=len(revisions))
+    else:
+        from huggingface_hub import HfApi
+        api = HfApi()
+        with reporter.phase('Resolving model revisions', total=len(set(models)), unit='model') as progress:
+            for model in dict.fromkeys(models):
+                revisions[model] = api.model_info(model).sha
+                progress.update(1, model=model)
     (run_dir / 'server-config.json').write_text(json.dumps({**vars(args), 'revisions': revisions}, indent=2) + '\n')
     cli = [sys.executable, '-m', 'decision_rag']
-    def run(*command):
+    def run(*command, use_cached_models=False):
         subprocess.run([str(x) for x in command], check=True,
-                       env={**os.environ, 'CUDA_VISIBLE_DEVICES': args.gpu_index, 'PYTHONUNBUFFERED': '1'})
+                       env=subprocess_environment(args.gpu_index, model_env if use_cached_models else None))
     with reporter.phase(f'Preparing {args.dataset}'):
         run(*cli, 'prepare', args.dataset, '--output', f'data/{args.dataset}')
     common = ['--corpus', f'data/{args.dataset}/corpus.jsonl', '--queries', f'data/{args.dataset}/queries.jsonl',
@@ -196,33 +258,43 @@ def run_suite(args, executable, run_dir, reporter):
               '--progress', args.progress, '--log-interval', str(args.log_interval)]
     if args.limit != 'all':
         common += ['--limit', args.limit]
-    completed, total = 0, 7 if args.ablations else 5
+    completed, total = 0, benchmark_count(args)
     def benchmark(name, extra):
         nonlocal completed
-        reporter.event('benchmark_started', f'Benchmark {completed + 1}/{total}: {name}',
-                       benchmark=name, completed=completed, total=total, output=str(run_dir / name))
+        selected = {key.removeprefix('--').replace('-', '_'): extra[extra.index(key) + 1]
+                    for key in ('--model', '--reranker-model') if key in extra}
+        label = name + (': ' + ', '.join(f'{key}={value}' for key, value in selected.items()) if selected else '')
+        reporter.event('benchmark_started', f'Benchmark {completed + 1}/{total}: {label}',
+                       benchmark=name, completed=completed, total=total, output=str(run_dir / name), **selected)
         started = time.monotonic()
-        run(*cli, 'benchmark', *common, *extra, '--output', run_dir / name)
+        run(*cli, 'benchmark', *common, *extra, '--output', run_dir / name, use_cached_models=True)
         completed += 1
-        reporter.event('benchmark_completed', f'Completed {completed}/{total}: {name}',
-                       benchmark=name, completed=completed, total=total,
+        reporter.event('benchmark_completed', f'Completed {completed}/{total}: {label}',
+                       benchmark=name, completed=completed, total=total, **selected,
                        benchmark_seconds=time.monotonic() - started)
+    def pooling_pair(embedding_model, reranker_model, suffix, log_directory, max_model_len):
+        with Servers(log_directory, executable, args.startup_timeout, args.gpu_index, reporter,
+                     model_env=model_env) as servers:
+            embedding_url = servers.start(embedding_model, revisions[embedding_model], args.port_base + 1,
+                                          'embedding', args.pool_memory, max_model_len)
+            dense = ['--engine', 'vllm', '--model', embedding_model, '--embedding-url', embedding_url,
+                     '--search-device', args.search_device,
+                     '--embedding-revision', revisions[embedding_model], '--index-dir',
+                     f'cache/vllm-dense/{args.dataset}/{embedding_model.replace("/", "_")}-{revisions[embedding_model]}']
+            benchmark(f'dense{suffix}-vllm', ['--method', 'dense', *dense])
+            reranker_url = servers.start(reranker_model, revisions[reranker_model], args.port_base + 2,
+                                         'reranker', args.pool_memory, max_model_len)
+            benchmark(f'dense-rerank{suffix}-vllm', ['--method', 'dense-rerank', *dense,
+                      '--reranker-model', reranker_model, '--reranker-url', reranker_url,
+                      '--reranker-revision', revisions[reranker_model]])
     if not args.ablations:
         benchmark('bm25', ['--method', 'bm25', '--search-device', args.search_device])
-        with Servers(run_dir / 'servers', executable, args.startup_timeout, args.gpu_index, reporter) as servers:
-            embedding_url = servers.start(args.embedding_model, revisions[args.embedding_model], args.port_base + 1,
-                                          'embedding', args.pool_memory, args.pool_max_model_len)
-            dense = ['--engine', 'vllm', '--model', args.embedding_model, '--embedding-url', embedding_url,
-                     '--search-device', args.search_device,
-                     '--embedding-revision', revisions[args.embedding_model], '--index-dir',
-                     f'cache/vllm-dense/{args.dataset}/{args.embedding_model.replace("/", "_")}-{revisions[args.embedding_model]}']
-            benchmark('dense-vllm', ['--method', 'dense', *dense])
-            reranker_url = servers.start(args.reranker_model, revisions[args.reranker_model], args.port_base + 2,
-                                         'reranker', args.pool_memory, args.pool_max_model_len)
-            benchmark('dense-rerank-vllm', ['--method', 'dense-rerank', *dense,
-                      '--reranker-model', args.reranker_model, '--reranker-url', reranker_url,
-                      '--reranker-revision', revisions[args.reranker_model]])
-    with Servers(run_dir / 'servers', executable, args.startup_timeout, args.gpu_index, reporter) as servers:
+        pooling_pair(args.embedding_model, args.reranker_model, '', run_dir / 'servers', args.pool_max_model_len)
+        if not args.skip_bge:
+            pooling_pair(args.bge_embedding_model, args.bge_reranker_model, '-bge', run_dir / 'servers' / 'bge',
+                         args.bge_max_model_len)
+    with Servers(run_dir / 'servers', executable, args.startup_timeout, args.gpu_index, reporter,
+                 model_env=model_env) as servers:
         decision_url = servers.start(args.naive_model, revisions[args.naive_model], args.port_base,
                                      'decision', args.decision_memory, args.max_model_len)
         naive = ['--backend', 'vllm', '--model', args.naive_model, '--model-revision', revisions[args.naive_model],

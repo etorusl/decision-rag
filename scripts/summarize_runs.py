@@ -12,6 +12,69 @@ from pathlib import Path
 QUALITY = ("hit@1", "recall@1", "recall@5", "recall@10", "ndcg@10", "mrr@10")
 
 
+def model_identity(config):
+    """Read recorded model identities, without guessing from directory names or current defaults."""
+    args = config.get('args') or config
+    runtime = config.get('runtime') or {}
+    retrieval = config.get('retrieval') or {}
+    backend = config.get('backend') or args.get('backend') or ''
+    method = config.get('method') or args.get('method') or 'unknown'
+    if method == 'unknown' and backend.startswith(('vllm-logits:', 'hf-logits:', 'trained-decision-head:', 'jev:')):
+        method = 'decision'
+    identity = {
+        'method': method, 'backend': backend,
+        'engine': config.get('engine') or runtime.get('engine') or runtime.get('runtime') or '',
+        'model': '', 'model_revision': '', 'embedding_model': '', 'embedding_revision': '',
+        'reranker_model': '', 'reranker_revision': '', 'checkpoint': '',
+    }
+    if method in {'dense', 'dense-rerank'}:
+        embedding = runtime.get('embedding') or {}
+        identity['embedding_model'] = (embedding.get('model') or runtime.get('embedding_model')
+                                       or args.get('embedding_model') or args.get('model') or '')
+        identity['embedding_revision'] = (embedding.get('revision') or runtime.get('embedding_revision')
+                                          or args.get('embedding_revision') or '')
+        if method == 'dense-rerank':
+            reranker = runtime.get('reranker') or {}
+            identity['reranker_model'] = (reranker.get('model') or runtime.get('reranker_model')
+                                          or args.get('reranker_model') or '')
+            identity['reranker_revision'] = (reranker.get('revision') or runtime.get('reranker_revision')
+                                             or args.get('reranker_revision') or '')
+        run_type = 'dense + rerank' if method == 'dense-rerank' else 'dense'
+        reranker_label = (identity['reranker_model'] or 'unknown') if method == 'dense-rerank' else 'none'
+        description = (f"{run_type} — embedder: {identity['embedding_model'] or 'unknown'}; "
+                       f"reranker: {reranker_label}")
+    elif method == 'decision':
+        head = backend.startswith('trained-decision-head:') or args.get('backend') == 'head'
+        identity['model'] = config.get('model') or runtime.get('base_model') or runtime.get('model') or ''
+        if head:
+            identity['checkpoint'] = config.get('checkpoint') or runtime.get('checkpoint') or args.get('checkpoint') or ''
+        else:
+            identity['model'] = identity['model'] or args.get('model') or ''
+            if not identity['model'] and backend.startswith(('vllm-logits:', 'hf-logits:')):
+                identity['model'] = backend.split(':', 1)[1]
+            elif not identity['model'] and backend.startswith('jev:'):
+                identity['model'] = backend.split(':', 2)[-1]
+        identity['model_revision'] = (config.get('model_revision') or runtime.get('base_revision')
+                                      or runtime.get('tokenizer_revision') or args.get('model_revision') or '')
+        choice_k = retrieval.get('choice_k', args.get('choice_k'))
+        scoring = 'choice' if choice_k is not None and choice_k > 0 else 'binary' if choice_k == 0 else ''
+        if head:
+            family = 'trained head'
+        elif backend.startswith(('vllm-logits:', 'hf-logits:')) or args.get('backend') in {'vllm', 'hf'}:
+            family = 'naive'
+        else:
+            family = 'decision'
+        run_type = ' '.join(part for part in (family, scoring) if part)
+        description = f"{run_type} — {identity['model'] or 'model unknown'}"
+        if identity['checkpoint']:
+            description += f"; checkpoint: {identity['checkpoint']}"
+    elif method == 'bm25':
+        run_type, description = 'BM25', 'BM25 — no neural model'
+    else:
+        run_type, description = method, f'{method} — model unknown'
+    return {**identity, 'run_type': run_type, 'run_label': description}
+
+
 def find_summaries(paths):
     found = set()
     for value in paths:
@@ -44,6 +107,7 @@ def flatten_summary(path):
     corpus_hashes = sorted(v for k, v in data.get("inputs", {}).items() if Path(k).name == "corpus.jsonl")
     row = {
         "run": str(path.parent),
+        **model_identity(config),
         "queries": count,
         "labeled_queries": data.get("labeled_queries", 0),
         "unlabeled_queries": data.get("unlabeled_queries", 0),
@@ -81,7 +145,8 @@ def flatten_summary(path):
 def csv_text(rows):
     if not rows:
         raise ValueError("No summary rows")
-    leading = ["run", "queries", "labeled_queries", "unlabeled_queries"]
+    leading = ["run", "run_type", "model", "embedding_model", "reranker_model",
+               "queries", "labeled_queries", "unlabeled_queries"]
     fields = leading + sorted(set().union(*(row.keys() for row in rows)) - set(leading))
     stream = io.StringIO(newline="")
     writer = csv.DictWriter(stream, fieldnames=fields)
@@ -118,11 +183,13 @@ def markdown_text(rows):
     display = [
         {
             **row,
-            "run_label": row["run"],
+            "report_id": f'R{index}',
+            "run_label": (f"R{index}: {row.get('run_label', 'unknown — model unknown')} "
+                          f"[{'/'.join(Path(row['run']).parts[-2:])}]"),
             "query_short": row.get("query_sha256", "")[:12],
             "corpus_short": row.get("corpus_sha256", "")[:12],
         }
-        for row in rows
+        for index, row in enumerate(rows, 1)
     ]
     text = [
         "# Retrieval run comparison",
@@ -167,6 +234,7 @@ def markdown_text(rows):
                 ("dedup_text", "Text dedup"),
                 ("warmup_queries", "Warmups"),
                 ("gpu", "GPU"),
+                ("engine", "Inference engine"),
                 ("search_device", "Search device"),
                 ("search_precision", "Search precision"),
                 ("git_dirty", "Dirty tree"),
@@ -176,7 +244,7 @@ def markdown_text(rows):
         "## Sources",
         "",
     ]
-    text.extend(f"- `{row['run']}` — {_cell(row.get('timing_scope'))}" for row in rows)
+    text.extend(f"- {row['report_id']}: `{row['run']}` — {_cell(row.get('timing_scope'))}" for row in display)
     return "\n".join(text) + "\n"
 
 

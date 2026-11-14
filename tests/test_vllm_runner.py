@@ -32,7 +32,8 @@ def test_server_commands_match_scoring_and_cache_contract():
     assert option(decision, "--host") == "127.0.0.1"
     assert option(decision, "--revision") == option(decision, "--tokenizer-revision") == "a" * 40
     for kind in ("embedding", "reranker"):
-        command = runner.server_command("vllm", "model", "a" * 40, 8001, kind, .4, 8192)
+        model = 'Qwen/Qwen3-Reranker-8B' if kind == 'reranker' else 'Qwen/Qwen3-Embedding-8B'
+        command = runner.server_command("vllm", model, "a" * 40, 8001, kind, .4, 8192)
         assert option(command, "--runner") == "pooling"
         assert "--no-enable-prefix-caching" in command
         assert "--logprobs-mode" not in command
@@ -43,6 +44,19 @@ def test_server_commands_match_scoring_and_cache_contract():
                 "classifier_from_token": ["no", "yes"],
                 "is_original_qwen3_reranker": True,
             }
+
+
+@pytest.mark.parametrize('kind,model', [('embedding', 'BAAI/bge-m3'),
+                                       ('reranker', 'BAAI/bge-reranker-v2-m3')])
+def test_bge_servers_use_native_pooling_without_qwen_conversion(kind, model):
+    command = runner.server_command('vllm', model, 'b' * 40, 8001, kind, .4, 8192)
+    assert option(command, '--runner') == 'pooling'
+    assert option(command, '--dtype') == 'bfloat16'
+    assert option(command, '--max-model-len') == '8192'
+    assert '--no-enable-prefix-caching' in command
+    assert '--no-enable-chunked-prefill' in command
+    assert '--hf-overrides' not in command
+    assert '--enforce-eager' not in command
 
 
 class Probe:
@@ -195,9 +209,11 @@ def fake_run(monkeypatch, tmp_path):
         assert 'stdout' not in kwargs and 'stderr' not in kwargs  # keep child terminal progress live
     monkeypatch.setattr(runner.subprocess, "run", run)
     class FakeServers:
-        def __init__(self, *args):
+        def __init__(self, *args, model_env=None):
             self.kinds = []
             events.append(('server_gpu', args[3]))
+            events.append(('server_logs', str(args[0])))
+            events.append(('server_env', model_env))
 
         def __enter__(self):
             events.append(("enter",))
@@ -219,23 +235,138 @@ def test_default_pipeline_uses_ready_vllm_models_and_releases_pooling_before_lm(
     runner.main(["scifact", "3", "--run-tag", "test"])
     benchmarks = [call for call in calls if "benchmark" in call]
     assert [Path(option(call, "--output")).name for call in benchmarks] == [
-        "bm25", "dense-vllm", "dense-rerank-vllm", "naive-binary-vllm", "naive-choice-vllm"]
+        "bm25", "dense-vllm", "dense-rerank-vllm", "dense-bge-vllm", "dense-rerank-bge-vllm",
+        "naive-binary-vllm", "naive-choice-vllm"]
     assert all(option(call, "--limit") == "3" for call in benchmarks)
     assert all(option(call, '--gpu-monitor-index') == '1' for call in benchmarks)
     assert set(masks) == {'1'}
-    assert [event for event in events if event[0] == 'server_gpu'] == [('server_gpu', '1')] * 2
-    for call in benchmarks[1:3]:
+    assert [event for event in events if event[0] == 'server_gpu'] == [('server_gpu', '1')] * 3
+    for call in benchmarks[1:5]:
         assert option(call, "--engine") == "vllm"
         assert option(call, "--embedding-revision") == "a" * 40
         assert option(call, '--search-device') == 'cuda'
     assert option(benchmarks[0], '--search-device') == 'cuda'
-    for call in benchmarks[3:]:
+    assert option(benchmarks[1], '--model') == 'Qwen/Qwen3-Embedding-8B'
+    assert option(benchmarks[2], '--reranker-model') == 'Qwen/Qwen3-Reranker-8B'
+    assert option(benchmarks[3], '--model') == 'BAAI/bge-m3'
+    assert option(benchmarks[4], '--reranker-model') == 'BAAI/bge-reranker-v2-m3'
+    assert option(benchmarks[1], '--index-dir') != option(benchmarks[3], '--index-dir')
+    for call in benchmarks[5:]:
         assert option(call, "--backend") == "vllm"
         assert option(call, "--preset") == "generic"
         assert option(call, "--model-revision") == "a" * 40
         assert '--search-device' not in call
     assert events.index(("close", "embedding", "reranker")) < events.index(("start", "decision"))
+    server_logs = [event[1] for event in events if event[0] == 'server_logs']
+    assert server_logs[1] == str(Path(server_logs[0]) / 'bge')
+    assert [event[0] for event in events if event[0] in ('enter', 'close')] == ['enter', 'close'] * 3
     assert not any("training" in str(call) or "--backend hf" in str(call) for call in calls)
+
+
+def test_original_matrix_remains_available_unchanged(fake_run):
+    calls, events, _ = fake_run
+    runner.main(['scifact', '3', '--run-tag', 'original', '--skip-bge'])
+    benchmarks = [call for call in calls if 'benchmark' in call]
+    assert [Path(option(call, '--output')).name for call in benchmarks] == [
+        'bm25', 'dense-vllm', 'dense-rerank-vllm', 'naive-binary-vllm', 'naive-choice-vllm']
+    assert all('BAAI/' not in str(call) for call in calls)
+    assert [event for event in events if event[0] == 'server_gpu'] == [('server_gpu', '1')] * 2
+
+
+def make_manifest(tmp_path):
+    models = ['Qwen/Qwen3-8B', 'Qwen/Qwen3-Embedding-8B', 'Qwen/Qwen3-Reranker-8B',
+              'BAAI/bge-m3', 'BAAI/bge-reranker-v2-m3']
+    cache = tmp_path / 'hf-cache'
+    entries = {}
+    for model in models:
+        snapshot = cache / ('models--' + model.replace('/', '--')) / 'snapshots' / ('b' * 40)
+        snapshot.mkdir(parents=True)
+        (snapshot / 'config.json').write_text('{}')
+        entries[model] = {'revision': 'b' * 40, 'snapshot_path': str(snapshot), 'files': ['config.json']}
+    path = tmp_path / 'manifest.json'
+    path.write_text(json.dumps({'format_version': 1, 'cache_dir': str(cache), 'models': entries}))
+    return path
+
+
+@pytest.mark.parametrize('use_manifest', [True, False])
+def test_manifest_cache_overrides_legacy_parent_cache_in_server(monkeypatch, tmp_path, use_manifest):
+    legacy_names = ('TRANSFORMERS_CACHE', 'PYTORCH_TRANSFORMERS_CACHE', 'PYTORCH_PRETRAINED_BERT_CACHE')
+    for name in ('HF_HUB_CACHE', *legacy_names):
+        monkeypatch.setenv(name, str(tmp_path / 'wrong-cache'))
+    _, model_env = runner.cached_revisions(make_manifest(tmp_path), ['Qwen/Qwen3-8B'])
+    environments = []
+    def popen(command, **kwargs):
+        environments.append(kwargs['env'])
+        return Process(running=False)
+    monkeypatch.setattr(runner.subprocess, 'Popen', popen)
+    monkeypatch.setattr(runner.socket, 'socket', lambda: Probe())
+    monkeypatch.setattr(runner.os, 'killpg', lambda *args: None)
+    with pytest.raises(RuntimeError, match='server exited'), runner.Servers(
+        tmp_path / 'servers', 'vllm', model_env=model_env if use_manifest else None
+    ) as servers:
+        servers.start('Qwen/Qwen3-8B', 'b' * 40, 8000, 'decision', .85, 32768)
+    env = environments[0]
+    assert env['HF_HUB_CACHE'] == str(tmp_path / ('hf-cache' if use_manifest else 'wrong-cache'))
+    for name in legacy_names:
+        if use_manifest:
+            assert name not in env
+        else:
+            assert env[name] == str(tmp_path / 'wrong-cache')
+        assert runner.os.environ[name] == str(tmp_path / 'wrong-cache')
+
+
+def test_manifest_pins_models_offline_without_disabling_dataset_downloads(fake_run, tmp_path, monkeypatch):
+    _, events, _ = fake_run
+    manifest = make_manifest(tmp_path)
+    monkeypatch.delenv('HF_HUB_OFFLINE', raising=False)
+    monkeypatch.delenv('TRANSFORMERS_OFFLINE', raising=False)
+    legacy_names = ('TRANSFORMERS_CACHE', 'PYTORCH_TRANSFORMERS_CACHE', 'PYTORCH_PRETRAINED_BERT_CACHE')
+    for name in ('HF_HUB_CACHE', *legacy_names):
+        monkeypatch.setenv(name, str(tmp_path / 'wrong-cache'))
+    monkeypatch.setitem(sys.modules, 'huggingface_hub', SimpleNamespace(
+        HfApi=lambda: pytest.fail('A downloaded manifest must not query Hugging Face')))
+    environments = []
+    original = runner.subprocess.run
+    def capture(command, **kwargs):
+        environments.append((command, kwargs['env']))
+        return original(command, **kwargs)
+    monkeypatch.setattr(runner.subprocess, 'run', capture)
+    runner.main(['scifact', '3', '--run-tag', 'manifest', '--model-manifest', str(manifest)])
+    for command, env in environments:
+        if 'benchmark' in command:
+            assert env['HF_HUB_OFFLINE'] == env['TRANSFORMERS_OFFLINE'] == '1'
+            assert env['HF_HUB_CACHE'] == str(tmp_path / 'hf-cache')
+            assert all(name not in env for name in legacy_names)
+        else:
+            assert 'HF_HUB_OFFLINE' not in env
+            assert all(env[name] == str(tmp_path / 'wrong-cache') for name in ('HF_HUB_CACHE', *legacy_names))
+    for event in events:
+        if event[0] == 'server_env':
+            assert event[1] == {'HF_HUB_OFFLINE': '1', 'TRANSFORMERS_OFFLINE': '1',
+                                'HF_HUB_CACHE': str(tmp_path / 'hf-cache')}
+    config = json.loads((tmp_path / 'results/manifest/scifact/server-config.json').read_text())
+    assert set(config['revisions'].values()) == {'b' * 40}
+
+
+@pytest.mark.parametrize('problem', ['missing_model', 'mutable_revision', 'missing_file', 'wrong_snapshot'])
+def test_incomplete_manifest_fails_before_any_inference(fake_run, tmp_path, problem):
+    calls, events, _ = fake_run
+    path = make_manifest(tmp_path)
+    manifest = json.loads(path.read_text())
+    entry = manifest['models']['BAAI/bge-m3']
+    if problem == 'missing_model':
+        del manifest['models']['BAAI/bge-m3']
+    elif problem == 'mutable_revision':
+        entry['revision'] = 'main'
+    elif problem == 'missing_file':
+        (Path(entry['snapshot_path']) / 'config.json').unlink()
+    else:
+        entry['snapshot_path'] = manifest['models']['Qwen/Qwen3-8B']['snapshot_path']
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError):
+        runner.main(['scifact', '3', '--run-tag', problem, '--model-manifest', str(path)])
+    assert not calls
+    assert not any(event[0] == 'start' for event in events)
 
 
 def test_ablations_run_only_inference_with_no_pooling_servers(fake_run):
@@ -254,7 +385,7 @@ def test_cpu_search_requires_explicit_selection_and_is_recorded(fake_run, tmp_pa
     calls, _, masks = fake_run
     runner.main(['scifact', '3', '--run-tag', 'cpu-search', '--search-device', 'cpu'])
     dense = [call for call in calls if '--engine' in call]
-    assert len(dense) == 2
+    assert len(dense) == 4
     assert all(option(call, '--search-device') == 'cpu' for call in dense)
     bm25 = next(call for call in calls if '--method' in call and option(call, '--method') == 'bm25')
     assert option(bm25, '--search-device') == 'cpu'
@@ -288,12 +419,13 @@ def test_suite_reports_stages_and_forwards_progress_settings(fake_run, tmp_path,
     assert all(float(option(call, '--log-interval')) == 7 for call in benchmarks)
     output = tmp_path / 'results' / 'logging' / 'scifact'
     records = [json.loads(line) for line in (output / 'events.jsonl').read_text().splitlines()]
-    assert [row['completed'] for row in records if row['event'] == 'benchmark_completed'] == list(range(1, 6))
+    assert [row['completed'] for row in records if row['event'] == 'benchmark_completed'] == list(range(1, 8))
     completed = next(row for row in records if row['event'] == 'suite_completed')
-    assert completed['completed'] == completed['total'] == 5
-    assert 'Completed 5/5: naive-choice-vllm' in (output / 'run.log').read_text()
+    assert completed['completed'] == completed['total'] == 7
+    assert 'Completed 7/7: naive-choice-vllm: model=Qwen/Qwen3-8B' in (output / 'run.log').read_text()
+    assert 'reranker_model=BAAI/bge-reranker-v2-m3' in (output / 'run.log').read_text()
     captured = capsys.readouterr()
-    assert 'Benchmark 1/5: bm25' in captured.err
+    assert 'Benchmark 1/7: bm25' in captured.err
     assert '\r' not in captured.err and '\x1b[' not in captured.err
 
 
@@ -303,7 +435,7 @@ def test_explicit_gpu_selection_routes_servers_clients_and_monitor_together(fake
     monkeypatch.setenv('DECISION_RAG_GPU_INDEX', '2')
     runner.main(['scifact', '3', '--run-tag', 'override', *cli_args])
     assert set(masks) == {expected}
-    assert [event for event in events if event[0] == 'server_gpu'] == [('server_gpu', expected)] * 2
+    assert [event for event in events if event[0] == 'server_gpu'] == [('server_gpu', expected)] * 3
     assert all(option(call, '--gpu-monitor-index') == expected for call in calls if 'benchmark' in call)
 
 

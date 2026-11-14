@@ -83,9 +83,14 @@ def _benchmark(args, reporter):
             model = getattr(backend, 'model', None)
             model = getattr(model, 'backbone', model)
             revision = getattr(getattr(model, 'config', None), '_commit_hash', None)
+            manifest = getattr(backend, 'manifest', {})
+            runtime = getattr(backend, 'runtime_metadata', {})
+            model_name = manifest.get('base_model') or getattr(backend, 'model_name', None) or runtime.get('model')
             config = {'method': args.method, 'backend': backend.name, 'retrieval': asdict(cfg),
-                      'model_revision': revision, 'args': vars(args),
-                      'runtime': getattr(backend, 'runtime_metadata', {})}
+                      'model': model_name,
+                      'model_revision': manifest.get('base_revision') or revision or runtime.get('tokenizer_revision'),
+                      'checkpoint': str(Path(args.checkpoint).resolve()) if args.backend == 'head' else None,
+                      'args': vars(args), 'runtime': runtime}
         elif args.method == 'bm25':
             from .baselines import BM25Retriever
             retriever = BM25Retriever(corpus, args.top_k, device=args.search_device)
