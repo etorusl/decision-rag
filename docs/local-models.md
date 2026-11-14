@@ -1,6 +1,8 @@
 # Local models and training
 
-Two local modes are implemented. Neither needs an API key.
+This document covers the explicit HF backend and custom-head training. Ready-model benchmarking defaults to [local vLLM](vllm.md).
+
+Two HF modes are implemented. Neither needs an API key.
 
 - `HFLogitBackend`: Qwen3-8B in non-thinking mode, scoring the next-token logits of `no` and `yes`. All candidates are visible in one shared context. Binary questions are independent branches in one packed backbone forward pass; no answer tokens are generated. Multiple-choice reranking uses a softmax over up to 26 single-token letters. This is a **zero-shot baseline**, not Jev and not an Appendix G checkpoint.
 - `DecisionHeadBackend`: Qwen3-Base with a trained cosine-similarity head, following Appendix G's architecture. Question and answer-option end states have separate learned projections into a common space. A learned inverse temperature is capped at 100; a softmax runs over each question's options. The loader requires a checkpoint with nonzero training steps and never silently uses a random head.

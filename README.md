@@ -3,9 +3,13 @@
 Самостоятельная реализация **Retriever-Free Retrieval: Navigating Documents with Decision Models**
 ([arXiv:2610.35868](https://arxiv.org/abs/2610.35868)). Основной сценарий — одна **H100 80 GB**, без внешнего API.
 
-Реализованы два локальных варианта:
+**Бенчмаркинг готовых моделей использует локальный vLLM, только inference.**
+Qwen3, Qwen3-Embedding и Qwen3-Reranker запускаются как localhost-серверы на H100.
+Обучение собственной head — отдельный эксперимент.
 
-1. **Без обучения:** Qwen3-8B оценивает `P(yes | context, question)` по logits. Все кандидаты видны в общем контексте, вопросы изолированы attention-mask и вычисляются одним проходом. Ответы не генерируются. Опционально — multiple-choice reranking.
+Реализованы два подхода:
+
+1. **Без обучения:** Qwen3-8B оценивает `P(yes | context, question)` по logits. Все кандидаты видны в общем контексте. vLLM оценивает отдельные вопросы с общим prefix KV и максимум одним label token. Дополнительный HF backend использует packed attention. Опционально — multiple-choice reranking.
 2. **С обучением:** Qwen3-8B-Base + cosine scoring-head из приложения G, изолированные ветки question/options, LoRA и локальная подготовка supervision. Отдельный checkpoint обязателен.
 
 Это воспроизведение архитектуры с документированными допущениями. **Локальные модели не равны Jev.**
@@ -21,28 +25,22 @@
 ```bash
 git clone git@github.com:etorusl/decision-rag.git
 cd decision-rag
-bash scripts/setup_h100.sh
-source .venv/bin/activate
+bash scripts/setup_vllm_h100.sh
+source .venv-vllm/bin/activate
 
 # Пять систем, первые 100 запросов, полный корпус:
 # BM25 / dense / dense+reranker / naive binary / naive+choice
 bash scripts/benchmark_h100.sh multidoc2dial 100
-
-# Проверка пути обучения: 10 обновлений + оценка 20 запросов
-bash scripts/train_h100.sh multidoc2dial smoke
-
-# Полное обучение и оценка trained-head
-bash scripts/train_h100.sh multidoc2dial full
 
 # Полные бенчмарки без обучения
 bash scripts/benchmark_h100.sh multidoc2dial all
 bash scripts/benchmark_h100.sh conditionalqa all
 ```
 
-Сначала запускайте короткие проверки. `setup_h100.sh` проверяет CUDA forward/backward
-на маленькой случайной Qwen3 без скачивания весов, затем запускает тесты.
+Сначала запускайте короткую выборку. Скрипт сам поднимает и останавливает локальные vLLM-серверы;
+для готовых моделей training-этапа нет. Установка vLLM изолирована в `.venv-vllm`.
 H100 memory/latency и качество больших моделей **ещё не измерены** на машине разработки.
-Подробные команды, параметры и обработка OOM: [инструкция H100](docs/h100.md).
+Подробные команды, параметры и обработка OOM: [инструкция vLLM](docs/vllm.md).
 
 ## Бенчмарки
 
@@ -62,7 +60,8 @@ NQ требует большого исходного DAPR-корпуса и о�
 MTRAG использует официальные gold labels: расширенные GPT-5 labels из статьи нам не даны.
 
 Для скорости сохраняются p50/p90/p95/p99, serial QPS, пиковая память CUDA,
-число запросов, forward passes, tokens и времена этапов. Измерение включает весь retrieval
+число HTTP-запросов, logical sequences, tokens и времена этапов. Внутренние vLLM forward passes
+не наблюдаются и отмечаются `null`; sampled GPU memory измеряется через `nvidia-smi`. Измерение включает весь retrieval
 после загрузки модели/корпуса; общее время инициализации/индексирования и время прогрева записываются отдельно.
 Компиляция новых форм запросов может остаться внутри измеряемых запросов.
 Каждый запуск пишет `queries.jsonl` и `summary.json`, commit SHA, версии и SHA256 входов.
@@ -79,6 +78,17 @@ decision-rag compare results/RUN/multidoc2dial/naive-binary \
 # Бюджет страниц, размер общего контекста, отключение памяти
 bash scripts/ablate_h100.sh multidoc2dial 100
 ```
+
+## Обучение собственной модели отдельно
+
+```bash
+bash scripts/setup_h100.sh  # отдельное .venv с PyTorch 2.7.1
+bash scripts/train_h100.sh multidoc2dial smoke
+bash scripts/train_h100.sh multidoc2dial full
+```
+
+Этот путь не нужен для inference готовых checkpoints. Подробности — [H100](docs/h100.md)
+и [scoring-head](docs/local-models.md).
 
 ## Разработка без GPU
 
