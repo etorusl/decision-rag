@@ -72,6 +72,76 @@ def test_reporter_cli_writes_outputs_and_preserves_source(tmp_path, capsys):
     assert source.read_bytes() == original
 
 
+def add_text_recall(source, *, sidecar=False):
+    summary = json.loads(source.read_text())
+    summary['text_recall'] = {
+        'quality': {'recall@1': .2051, 'recall@5': .5, 'recall@10': .75, 'recall@20': 1},
+        'id_quality': {'recall@1': .0934, 'recall@5': .25, 'recall@10': .50, 'recall@20': .75},
+        'ranking_limit': 20, 'max_saved_ids': 19, 'limited_to_saved_ranking': True,
+        'domains': {
+            'DMV': {'queries': 1, 'labeled_queries': 1, 'id_quality': {'recall@1': .1},
+                    'quality': {'recall@1': .3}},
+            'SSA': {'queries': 2, 'labeled_queries': 1, 'id_quality': {'recall@1': .0934},
+                    'quality': {'recall@1': .2051}},
+            'VA': {'queries': 1, 'labeled_queries': 1, 'id_quality': {'recall@1': 0},
+                   'quality': {'recall@1': .1}},
+            'Student Aid': {'queries': 0, 'labeled_queries': 0, 'id_quality': {}, 'quality': {}},
+        },
+    }
+    destination = source.with_name('summary.text-recall.json') if sidecar else source
+    destination.write_text(json.dumps(summary))
+    return destination
+
+
+def test_text_recall_report_shows_id_and_text_together_and_retains_legacy_columns(tmp_path):
+    original_only = write_summary(tmp_path / 'generic')
+    with_text = write_summary(tmp_path / 'multidoc2dial/naive-binary')
+    add_text_recall(with_text)
+    rows = [reporter.flatten_summary(path) for path in (original_only, with_text)]
+    legacy_csv = csv.DictReader(io.StringIO(reporter.csv_text(rows[:1])))
+    mixed_csv = csv.DictReader(io.StringIO(reporter.csv_text(rows)))
+    assert [field for field in mixed_csv.fieldnames if not field.startswith('text_recall.')] == legacy_csv.fieldnames
+    old, new = list(mixed_csv)
+    assert old['quality.recall@1'] == '0.5' and old['text_recall.quality.recall@1'] == ''
+    assert new['quality.recall@1'] == '0.5'
+    assert new['text_recall.id_quality.recall@1'] == '0.0934'
+    assert new['text_recall.quality.recall@1'] == '0.2051'
+    assert new['text_recall.domains.SSA.queries'] == '2'
+    assert new['text_recall.domains.SSA.labeled_queries'] == '1'
+
+    legacy_markdown = reporter.markdown_text(rows[:1])
+    assert 'Text recall@1' not in legacy_markdown
+    assert 'MultiDoc2Dial by domain' not in legacy_markdown
+    markdown = reporter.markdown_text(rows)
+    assert '| ID recall@1 | Text recall@1 | ID recall@5 | Text recall@5 |' in markdown
+    assert '| ID recall@20 | Text recall@20 |' in markdown
+    assert '| 9.34% | 20.51% |' in markdown
+    assert 'ID Recall is the primary metric' in markdown
+    assert 'Top 20 IDs' in markdown and 'fewer than 20 unique texts' in markdown
+    domains = markdown.split('## MultiDoc2Dial by domain', 1)[1].split('## Efficiency', 1)[0]
+    assert all(f'| {name} |' in domains for name in ('DMV', 'SSA', 'VA', 'Student Aid'))
+    assert '| SSA | 2 | 1 | 9.34% | 20.51% |' in domains
+
+
+def test_reporter_uses_text_recall_sidecar_once_without_changing_original_summary(tmp_path, capsys):
+    source = write_summary(tmp_path / 'run')
+    original = source.read_bytes()
+    sidecar = add_text_recall(source, sidecar=True)
+    assert reporter.find_summaries([str(tmp_path), source, sidecar]) == [source]
+    for path in (source, sidecar):
+        row = reporter.flatten_summary(path)
+        assert row['quality.recall@1'] == .5
+        assert row['text_recall.quality.recall@1'] == .2051
+    reporter.main([str(sidecar), str(source.parent), '--output', str(tmp_path / 'comparison')])
+    report_rows = list(csv.DictReader(io.StringIO((tmp_path / 'comparison.csv').read_text())))
+    assert len(report_rows) == 1
+    assert '20.51%' in capsys.readouterr().out
+    assert source.read_bytes() == original
+    source.unlink()
+    assert reporter.find_summaries([source.parent]) == [sidecar]
+    assert reporter.flatten_summary(sidecar)['text_recall.quality.recall@1'] == .2051
+
+
 def test_reporter_exposes_search_device_and_component_latency(tmp_path):
     source = write_summary(tmp_path / 'gpu')
     summary = json.loads(source.read_text())

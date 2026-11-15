@@ -10,6 +10,10 @@ import json
 from pathlib import Path
 
 QUALITY = ("hit@1", "recall@1", "recall@5", "recall@10", "ndcg@10", "mrr@10")
+RECALL = ("recall@1", "recall@5", "recall@10", "recall@20")
+MULTIDOC2DIAL_DOMAINS = ("DMV", "SSA", "VA", "Student Aid", "Unassigned")
+SUMMARY_NAME = "summary.json"
+TEXT_RECALL_SIDECAR = "summary.text-recall.json"
 
 
 def model_identity(config):
@@ -77,25 +81,54 @@ def model_identity(config):
 
 
 def find_summaries(paths):
-    found = set()
+    directories = set()
+    names = {SUMMARY_NAME, TEXT_RECALL_SIDECAR}
     for value in paths:
         path = Path(value)
         if not path.exists():
             raise ValueError(f"Results path does not exist: {path}")
         if path.is_file():
-            if path.name != "summary.json":
-                raise ValueError(f"Expected summary.json, got {path}")
-            found.add(path.resolve())
+            if path.name not in names:
+                raise ValueError(f"Expected {SUMMARY_NAME} or {TEXT_RECALL_SIDECAR}, got {path}")
+            directories.add(path.parent.resolve())
         else:
-            found.update(p.resolve() for p in path.rglob("summary.json"))
-    if not found:
+            directories.update(p.parent.resolve() for p in path.rglob("summary*.json") if p.name in names and p.is_file())
+    if not directories:
         raise ValueError("No summary.json files found")
-    return sorted(found)
+    return sorted(directory / (SUMMARY_NAME if (directory / SUMMARY_NAME).is_file() else TEXT_RECALL_SIDECAR)
+                  for directory in directories)
+
+
+def _read_summary(path):
+    summary = path.with_name(SUMMARY_NAME)
+    sidecar = path.with_name(TEXT_RECALL_SIDECAR)
+    if path == sidecar and summary.is_file():
+        path = summary
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if sidecar.is_file():
+        enriched = data if path == sidecar else json.loads(sidecar.read_text(encoding="utf-8"))
+        data["text_recall"] = enriched["text_recall"]
+    return data
+
+
+def _flatten_text_recall(text_recall):
+    row = {f"text_recall.{key}": text_recall.get(key) for key in (
+        "ranking_limit", "max_saved_ids", "limited_to_saved_ranking",
+    )}
+    for series in ("id_quality", "quality"):
+        row.update({f"text_recall.{series}.{metric}": value for metric, value in text_recall.get(series, {}).items()})
+    for domain, scores in text_recall.get("domains", {}).items():
+        prefix = f"text_recall.domains.{domain}"
+        for count in ("queries", "labeled_queries"):
+            row[f"{prefix}.{count}"] = scores.get(count)
+        for series in ("id_quality", "quality"):
+            row.update({f"{prefix}.{series}.{metric}": value for metric, value in scores.get(series, {}).items()})
+    return row
 
 
 def flatten_summary(path):
     path = Path(path)
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = _read_summary(path)
     if "quality" not in data or "latency" not in data:
         raise ValueError(f"Not an evaluation summary: {path}")
     latency, work = data["latency"], data.get("work", {})
@@ -136,6 +169,8 @@ def flatten_summary(path):
         "config_json": json.dumps(config, sort_keys=True),
     }
     row.update({f"quality.{key}": value for key, value in data["quality"].items()})
+    if data.get("text_recall") is not None:
+        row.update(_flatten_text_recall(data["text_recall"]))
     row.update({f"latency.{key}": value for key, value in latency.items() if key != "queries"})
     for component in ('query_embedding', 'vector_search'):
         seconds = data.get('component_latency', {}).get(component, {}).get('mean_seconds')
@@ -159,7 +194,20 @@ def csv_text(rows):
         raise ValueError("No summary rows")
     leading = ["run", "run_type", "model", "embedding_model", "reranker_model", "execution_mode", "query_concurrency",
                "queries", "labeled_queries", "unlabeled_queries"]
-    fields = leading + sorted(set().union(*(row.keys() for row in rows)) - set(leading))
+    remaining = set().union(*(row.keys() for row in rows)) - set(leading)
+    fields = list(leading)
+    legacy_recall_fields = {f"quality.{metric}" for metric in RECALL}
+    for field in sorted(key for key in remaining if not key.startswith("text_recall.")):
+        fields.append(field)
+        remaining.remove(field)
+        if field in legacy_recall_fields:
+            metric = field.removeprefix("quality.")
+            for series in ("id_quality", "quality"):
+                extra = f"text_recall.{series}.{metric}"
+                if extra in remaining:
+                    fields.append(extra)
+                    remaining.remove(extra)
+    fields.extend(sorted(remaining))
     stream = io.StringIO(newline="")
     writer = csv.DictWriter(stream, fieldnames=fields)
     writer.writeheader()
@@ -189,9 +237,39 @@ def _table(rows, columns, percentages=()):
     return "\n".join(lines)
 
 
+def _recall_columns(id_prefix, text_prefix):
+    columns = []
+    for metric in RECALL:
+        columns.extend([(id_prefix + metric, f"ID {metric}"), (text_prefix + metric, f"Text {metric}")])
+    return columns
+
+
+def _saved_ranking(row):
+    if "text_recall.limited_to_saved_ranking" not in row:
+        return None
+    if not row["text_recall.limited_to_saved_ranking"]:
+        return "Full ranking"
+    limit = row.get("text_recall.ranking_limit")
+    maximum = row.get("text_recall.max_saved_ids")
+    if limit is not None:
+        depth = f"Top {limit} IDs"
+        return f"{depth} (at most {maximum} saved)" if maximum is not None and maximum < limit else depth
+    return f"At most {maximum} IDs saved" if maximum is not None else "Saved IDs"
+
+
+def _domain_rows(rows):
+    domains = []
+    for row in rows:
+        for domain in MULTIDOC2DIAL_DOMAINS:
+            prefix = f"text_recall.domains.{domain}."
+            fields = {key.removeprefix(prefix): value for key, value in row.items() if key.startswith(prefix)}
+            if fields:
+                domains.append({"run_label": row["run_label"], "domain": domain, **fields})
+    return domains
+
+
 def markdown_text(rows):
     quality_columns = [("run_label", "Run"), ("queries", "Queries"), ("labeled_queries", "Labeled")]
-    quality_columns += [(f"quality.{metric}", metric) for metric in QUALITY]
     display = [
         {
             **row,
@@ -204,6 +282,39 @@ def markdown_text(rows):
         }
         for index, row in enumerate(rows, 1)
     ]
+    quality_percentages = [f"quality.{m}" for m in QUALITY]
+    recall_notes = []
+    if any("text_recall.limited_to_saved_ranking" in row for row in rows):
+        recall_columns = _recall_columns("report_id_quality.", "text_recall.quality.")
+        quality_columns += [("quality.hit@1", "hit@1"), *recall_columns,
+                            ("quality.ndcg@10", "ndcg@10"), ("quality.mrr@10", "mrr@10"),
+                            ("saved_ranking", "Saved ranking")]
+        quality_percentages.extend(key for key, _ in recall_columns)
+        for row in display:
+            row["saved_ranking"] = _saved_ranking(row)
+            for metric in RECALL:
+                legacy = row.get(f"quality.{metric}") if not row.get("dedup_text") else None
+                row[f"report_id_quality.{metric}"] = row.get(f"text_recall.id_quality.{metric}", legacy)
+        recall_notes.extend([
+            ("ID Recall is the primary metric. Text Recall counts the first occurrence of each identical text "
+             "after whitespace normalization, with case preserved."),
+            ("Text Recall uses the saved IDs shown in each row. A saved top-20 ranking can contain fewer than "
+             "20 unique texts, so additional texts below the saved cutoff cannot contribute."),
+            "",
+        ])
+    else:
+        quality_columns += [(f"quality.{metric}", metric) for metric in QUALITY]
+    domain_rows = _domain_rows(display)
+    domain_section = []
+    if domain_rows:
+        domain_recall = _recall_columns("id_quality.", "quality.")
+        domain_section.extend([
+            "## MultiDoc2Dial by domain", "",
+            _table(domain_rows, [("run_label", "Run"), ("domain", "Domain"), ("queries", "Queries"),
+                                 ("labeled_queries", "Labeled"), *domain_recall],
+                   [key for key, _ in domain_recall]),
+            "",
+        ])
     text = [
         "# Retrieval run comparison",
         "",
@@ -215,8 +326,10 @@ def markdown_text(rows):
         "",
         "## Quality",
         "",
-        _table(display, quality_columns, [f"quality.{m}" for m in QUALITY]),
+        *recall_notes,
+        _table(display, quality_columns, quality_percentages),
         "",
+        *domain_section,
         "## Efficiency",
         "",
         _table(
@@ -297,7 +410,7 @@ def paired_comparison(left_dir, right_dir, metric="recall@10", samples=2000, see
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "paths", nargs="+", help="Result directories or summary.json paths (searched recursively)"
+        "paths", nargs="+", help="Result directories, summary.json or summary.text-recall.json paths"
     )
     parser.add_argument("--output", default="results/comparison", help="Output prefix; writes .csv and .md")
     parser.add_argument("--paired", nargs=2, metavar=("RUN_A", "RUN_B"))

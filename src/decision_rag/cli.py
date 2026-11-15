@@ -212,7 +212,8 @@ def main(argv=None):
     bench.add_argument('--independent', action='store_true', help='Ablation: one candidate per context')
     bench.add_argument('--limit', type=int)
     bench.add_argument('--warmup', type=int, default=2)
-    bench.add_argument('--dedup-text', action='store_true')
+    bench.add_argument('--dedup-text', action='store_true',
+                       help='Use legacy text dedup scoring outside MultiDoc2Dial, which reports both Recalls')
     bench.add_argument('--engine', choices=['vllm','hf'], default='vllm', help='Dense/reranker inference engine')
     bench.add_argument('--base-url', default='http://127.0.0.1:8000', help='Local vLLM decision server')
     bench.add_argument('--embedding-url', default='http://127.0.0.1:8001')
@@ -250,6 +251,10 @@ def main(argv=None):
     compare.add_argument('--metric', default='recall@10')
     compare.add_argument('--samples', type=int, default=2000)
     compare.add_argument('--seed', type=int, default=42)
+    rescore = subs.add_parser('rescore-text', help='Score saved MultiDoc2Dial rankings by ID and text without inference')
+    rescore.add_argument('run_dirs', nargs='+', help='Completed benchmark method directories')
+    rescore.add_argument('--corpus', required=True, help='Prepared corpus used by the original benchmark')
+    rescore.add_argument('--gold', '--queries', dest='gold', required=True, help='Prepared gold queries JSONL')
     args = parser.parse_args(argv)
     if args.command == 'prepare':
         from .datasets import prepare
@@ -263,6 +268,9 @@ def main(argv=None):
         result = paired_bootstrap(list(read_jsonl(Path(args.run_a)/'queries.jsonl')),
                                   list(read_jsonl(Path(args.run_b)/'queries.jsonl')),
                                   args.metric, args.samples, args.seed)
+    elif args.command == 'rescore-text':
+        from .rescore import rescore_run
+        result = [rescore_run(run_dir, args.corpus, args.gold) for run_dir in args.run_dirs]
     elif args.command == 'training-data':
         from transformers import AutoTokenizer
 

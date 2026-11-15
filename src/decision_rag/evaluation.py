@@ -17,6 +17,7 @@ from pathlib import Path
 from .backends.base import sum_known
 from .metrics import aggregate, latency_summary, retrieval_metrics
 from .observability import RunReporter
+from .text_recall import TextRecall, group_relevance, is_multidoc2dial, text_groups
 
 
 def synchronize():
@@ -174,7 +175,27 @@ def _restore_query_order(output, offsets):
         ordered.unlink(missing_ok=True)
 
 
-def _evaluate_throughput(retriever, queries, output, *, warmup, config, source_paths, dedup_text,
+def _quality_for_ranking(query, ranking, canonical, text_recall):
+    relevant = query.relevant_ids
+    if canonical:
+        ranking = [canonical[passage_id] for passage_id in ranking]
+        relevant = group_relevance(relevant, canonical)
+    metrics = retrieval_metrics(ranking, relevant)
+    extra = {'text_recall': text_recall.add(query, ranking, metrics)} if text_recall is not None else {}
+    return metrics, extra
+
+
+def _ranking_limit(retriever, config):
+    limit = getattr(retriever, 'top_k', None)
+    if limit is None:
+        limit = getattr(getattr(retriever, 'config', None), 'top_k', None)
+    if limit is None and config:
+        limit = config.get('args', {}).get('top_k', config.get('top_k'))
+    return limit
+
+
+def _evaluate_throughput(retriever, queries, output, *, warmup, config, source_paths, canonical,
+                         dedup_normalization, text_recall,
                          initialization_seconds, gpu_monitor_index, reporter, query_concurrency, worker_factory):
     groups = _conversation_groups(queries)
     effective = min(query_concurrency, len(groups))
@@ -217,7 +238,8 @@ def _evaluate_throughput(retriever, queries, output, *, warmup, config, source_p
                 worker.reset()
         summary = _measure_throughput(
             retriever, queries, workers, groups, output, config=config, source_paths=source_paths,
-            dedup_text=dedup_text, initialization_seconds=initialization_seconds,
+            canonical=canonical, dedup_normalization=dedup_normalization, text_recall=text_recall,
+            initialization_seconds=initialization_seconds,
             worker_initialization_seconds=worker_initialization_seconds,
             warmup_seconds=warmup_seconds, warmup_queries=actual_warmup,
             warmup_queries_per_worker=per_worker_warmup, gpu_monitor_index=gpu_monitor_index,
@@ -244,18 +266,10 @@ def _evaluate_throughput(retriever, queries, output, *, warmup, config, source_p
     return summary
 
 
-def _measure_throughput(retriever, queries, workers, groups, output, *, config, source_paths, dedup_text,
+def _measure_throughput(retriever, queries, workers, groups, output, *, config, source_paths, canonical,
+                        dedup_normalization, text_recall,
                         initialization_seconds, worker_initialization_seconds, warmup_seconds, warmup_queries,
                         warmup_queries_per_worker, gpu_monitor_index, reporter, query_concurrency):
-    canonical = {}
-    lowercase_dedup = bool(queries) and all(q.metadata.get('dataset') == 'mtrag' for q in queries)
-    if dedup_text:
-        import re
-        for passage in retriever.corpus.passages:
-            key = re.sub(r'\s+', ' ', passage.text).strip()
-            if lowercase_dedup:
-                key = key.lower()
-            canonical[passage.id] = hashlib.sha256(key.encode()).hexdigest()
     metrics, latencies, component_times, offsets = {}, {}, {}, {}
     work = {key: 0 for key in ('input_tokens', 'forward_passes', 'requests')}
     total_latency, recall_sum, labeled = 0.0, 0.0, 0
@@ -265,18 +279,10 @@ def _measure_throughput(retriever, queries, workers, groups, output, *, config, 
             monitor, (output / 'queries.jsonl').open('w', encoding='utf-8') as stream:
         def collect(index, query, result, elapsed):
             nonlocal total_latency, recall_sum, labeled
-            ranking, relevant = result.ids, query.relevant_ids
-            if canonical:
-                ranking = [canonical[x] for x in ranking]
-                grouped_relevance = {}
-                for passage, grade in relevant.items():
-                    key = canonical[passage]
-                    grouped_relevance[key] = max(grade, grouped_relevance.get(key, grade))
-                relevant = grouped_relevance
-            measured = retrieval_metrics(ranking, relevant)
+            measured, extra = _quality_for_ranking(query, result.ids, canonical, text_recall)
             record = {**result.to_dict(), 'query_index': index, 'conversation_id': query.conversation_id,
                       'turn_id': query.turn_id, 'latency_seconds': elapsed, 'metrics': measured,
-                      'labeled': bool(measured)}
+                      'labeled': bool(measured), **extra}
             offsets[index] = stream.tell()
             stream.write(json.dumps(record, ensure_ascii=False) + '\n')
             stream.flush()
@@ -321,6 +327,7 @@ def _measure_throughput(retriever, queries, workers, groups, output, *, config, 
 
     return {
         'quality': aggregate([metrics[index] for index in sorted(metrics)]),
+        **({'text_recall': text_recall.summary()} if text_recall is not None else {}),
         'labeled_queries': labeled, 'unlabeled_queries': len(queries) - labeled,
         'latency': concurrent_latency([latencies[index] for index in sorted(latencies)]),
         'throughput': {'queries_per_second': len(latencies) / wall_seconds if wall_seconds else None,
@@ -336,8 +343,7 @@ def _measure_throughput(retriever, queries, workers, groups, output, *, config, 
         'worker_initialization_seconds': worker_initialization_seconds,
         'timing_scope': 'Closed-loop conversation workers after initialization and per-worker warmup; '
                         'wall time includes scheduling, prepare_query, retrieval and collector; no result cache',
-        'dedup_text': dedup_text,
-        'dedup_normalization': ('whitespace+lowercase' if lowercase_dedup else 'whitespace') if dedup_text else None,
+        'dedup_text': dedup_normalization is not None, 'dedup_normalization': dedup_normalization,
         'environment': environment(), 'config': config or {},
         'inputs': {str(path): file_hash(path) for path in source_paths}, 'work': work,
         'component_latency': {name: concurrent_latency(values) for name, values in component_times.items()},
@@ -396,10 +402,18 @@ def _evaluate(retriever, queries, output, *, warmup, config, source_paths, dedup
             if query.turn_id <= previous:
                 raise ValueError(f"Non-increasing turns in conversation {query.conversation_id}")
             last[query.conversation_id] = query.turn_id
+    canonical, dedup_normalization, text_recall = {}, None, None
+    if is_multidoc2dial(queries):
+        text_recall = TextRecall(retriever.corpus, ranking_limit=_ranking_limit(retriever, config))
+    elif dedup_text:
+        lowercase = bool(queries) and all(query.metadata.get('dataset') == 'mtrag' for query in queries)
+        canonical = text_groups(retriever.corpus, lowercase=lowercase)
+        dedup_normalization = 'whitespace+lowercase' if lowercase else 'whitespace'
     if execution_mode == 'throughput':
         return _evaluate_throughput(
             retriever, queries, output, warmup=warmup, config=config, source_paths=source_paths,
-            dedup_text=dedup_text, initialization_seconds=initialization_seconds,
+            canonical=canonical, dedup_normalization=dedup_normalization, text_recall=text_recall,
+            initialization_seconds=initialization_seconds,
             gpu_monitor_index=gpu_monitor_index, reporter=reporter, query_concurrency=query_concurrency,
             worker_factory=worker_factory)
     external = bool(getattr(retriever, "external_inference", False))
@@ -428,15 +442,6 @@ def _evaluate(retriever, queries, output, *, warmup, config, source_paths, dedup
         import torch
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
-    canonical = {}
-    lowercase_dedup = bool(queries) and all(q.metadata.get("dataset") == "mtrag" for q in queries)
-    if dedup_text:
-        import re
-        for p in retriever.corpus.passages:
-            key = re.sub(r'\s+', ' ', p.text).strip()
-            if lowercase_dedup:
-                key = key.lower()
-            canonical[p.id] = hashlib.sha256(key.encode()).hexdigest()
     metrics, latencies = [], []
     component_times = {}
     total_latency, recall_sum, labeled = 0.0, 0.0, 0
@@ -453,17 +458,10 @@ def _evaluate(retriever, queries, output, *, warmup, config, source_paths, dedup
             result = retriever.retrieve(query)
             sync()
             elapsed = time.perf_counter() - start
-            relevant = query.relevant_ids
-            ranking = result.ids
-            if canonical:
-                ranking = [canonical[x] for x in ranking]
-                relevant = {canonical[x]: max(v, max((w for y, w in relevant.items()
-                                                      if canonical[y] == canonical[x]), default=0))
-                            for x, v in relevant.items()}
-            measured = retrieval_metrics(ranking, relevant)
+            measured, extra = _quality_for_ranking(query, result.ids, canonical, text_recall)
             record = {**result.to_dict(), "conversation_id": query.conversation_id,
                       "turn_id": query.turn_id, "latency_seconds": elapsed, "metrics": measured,
-                      "labeled": bool(measured)}
+                      "labeled": bool(measured), **extra}
             stream.write(json.dumps(record, ensure_ascii=False) + '\n')
             stream.flush()
             metrics.append(measured)
@@ -504,8 +502,8 @@ def _evaluate(retriever, queries, output, *, warmup, config, source_paths, dedup
                              "observed_query_concurrency": int(bool(queries)),
                              "scheduling": "serial_input_order",
                              "latency_scope": "retrieve only; excludes prepare_query and collector"},
-               "dedup_text": dedup_text,
-               "dedup_normalization": ("whitespace+lowercase" if lowercase_dedup else "whitespace") if dedup_text else None,
+               "dedup_text": dedup_normalization is not None,
+               "dedup_normalization": dedup_normalization,
                "environment": environment(), "config": config or {},
                "inputs": {str(p): file_hash(p) for p in source_paths},
                "work": work,
@@ -513,6 +511,8 @@ def _evaluate(retriever, queries, output, *, warmup, config, source_paths, dedup
                "local_search_device": local_search_device,
                "inference_process": process,
                "gpu_telemetry": monitor.summary()}
+    if text_recall is not None:
+        summary['text_recall'] = text_recall.summary()
     if not external and 'torch' in sys.modules:
         import torch
         if torch.cuda.is_available():

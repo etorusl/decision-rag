@@ -166,6 +166,38 @@ Serial QPS относится только к последовательному
 Для dense в данных по запросам отдельно сохранены время embedding и GPU-поиска.
 Это retrieval-бенчмарк: генерация финального ответа и её качество здесь не измеряются.
 
+### Recall по тексту на MultiDoc2Dial
+
+`quality.recall@k` по ID остаётся основной метрикой. MultiDoc2Dial дополнительно
+сохраняет `text_recall` для k = 1, 5, 10 и 20. Тексты сравниваются целиком после
+нормализации пробелов с сохранением регистра. Повторы одного текста в gold
+и выдаче учитываются один раз. Позиция группы равна позиции её первого появления
+среди уникальных текстов. Обе метрики используют один список `ids` из `queries.jsonl`.
+Markdown и CSV содержат разбивку по DMV, SSA, VA и Student Aid с числом запросов.
+[Appendix E.1](https://arxiv.org/pdf/2610.35868#page=19)
+
+Для завершённых прогонов пересчёт выполняется на CPU по сохранённым файлам:
+
+```bash
+decision-rag rescore-text \
+  results/RUN_A/multidoc2dial/naive-binary-vllm \
+  results/RUN_B/multidoc2dial/naive-binary-vllm \
+  --corpus data/multidoc2dial/corpus.jsonl \
+  --gold data/multidoc2dial/queries.jsonl
+
+python scripts/summarize_runs.py \
+  results/RUN_A/multidoc2dial/naive-binary-vllm \
+  results/RUN_B/multidoc2dial/naive-binary-vllm \
+  --output results/multidoc2dial-recall
+```
+
+Пересчёт сверяет записанные хеши корпуса и gold, если они есть, и пишет рядом
+`summary.text-recall.json`. `summarize_runs.py` автоматически подхватывает этот файл
+при чтении обычного `summary.json`. Результаты с ограниченной выдачей считаются только
+по сохранённым позициям. Например, после удаления дублей в top-20 может остаться
+меньше 20 уникальных текстов, и R@20 будет считаться по ним. Это ограничение отражается
+в отчёте. Флаг `--dedup-text` нужен для старого режима подсчёта на других датасетах.
+
 ## 5. Дополнительные прогоны
 
 ### Восстановить прерванный suite с новым concurrency
