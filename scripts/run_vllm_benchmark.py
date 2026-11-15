@@ -60,12 +60,13 @@ def check_modern_runtime(models):
 
 
 def server_command(executable, model, revision, port, kind, memory, max_model_len, *,
-                   max_num_seqs=None, max_num_batched_tokens=None):
+                   max_num_seqs=None, max_num_batched_tokens=None, model_path=None):
     if max_num_seqs is None:
         max_num_seqs = 64 if kind == 'decision' else 16
     if max_num_batched_tokens is None:
         max_num_batched_tokens = max(16384, max_model_len)
-    command = [str(executable), 'serve', model, '--host', '127.0.0.1', '--port', str(port),
+    command = [str(executable), 'serve', str(model_path) if model_path else model,
+               '--host', '127.0.0.1', '--port', str(port),
                '--served-model-name', model, '--revision', revision, '--tokenizer-revision', revision,
                '--dtype', 'bfloat16', '--tensor-parallel-size', '1',
                '--gpu-memory-utilization', str(memory), '--max-model-len', str(max_model_len),
@@ -73,6 +74,11 @@ def server_command(executable, model, revision, port, kind, memory, max_model_le
                '--max-num-seqs', str(max_num_seqs),
                '--max-num-batched-tokens', str(max_num_batched_tokens),
                '--generation-config', 'vllm', '--enable-prompt-tokens-details']
+    if model_path:
+        # vLLM's offline repo-ID resolver requests an entire HF snapshot. A
+        # manifest contains only inference files, so use its verified directory
+        # for weights and tokenizer while preserving the public model identity.
+        command += ['--tokenizer', str(model_path)]
     if kind == 'decision':
         command += ['--logprobs-mode', 'processed_logprobs', '--max-logprobs', '26', '--enable-prefix-caching']
         # Qwen3.5's hybrid attention needs aligned recurrent-state caching and chunked prefill.
@@ -87,6 +93,18 @@ def server_command(executable, model, revision, port, kind, memory, max_model_le
     return command
 
 
+def server_failure(message, log_path):
+    """Keep the underlying startup error visible without reading an unbounded log."""
+    try:
+        with Path(log_path).open('rb') as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - 16384))
+            tail = '\n'.join(stream.read(16384).decode('utf-8', errors='replace').splitlines()[-60:])
+    except OSError:
+        tail = ''
+    return f'{message}; inspect {log_path}' + (f'\nLast server log lines:\n{tail}' if tail else '')
+
+
 def subprocess_environment(gpu_index, model_env=None):
     env = {**os.environ, 'CUDA_VISIBLE_DEVICES': gpu_index, 'PYTHONUNBUFFERED': '1'}
     if model_env and 'HF_HUB_CACHE' in model_env:
@@ -99,12 +117,13 @@ def subprocess_environment(gpu_index, model_env=None):
 
 class Servers:
     def __init__(self, log_dir, executable, startup_timeout=1200, gpu_index='1', reporter=None,
-                 *, model_env=None):
+                 *, model_env=None, model_paths=None):
         self.log_dir, self.executable = Path(log_dir), executable
         self.startup_timeout = startup_timeout
         self.gpu_index = gpu_index
         self.reporter = reporter
         self.model_env = model_env or {}
+        self.model_paths = model_paths or {}
         self.processes = []
 
     def start(self, model, revision, port, kind, memory, max_model_len, *,
@@ -113,7 +132,8 @@ class Servers:
             if probe.connect_ex(('127.0.0.1', port)) == 0:
                 raise RuntimeError(f'Port {port} is occupied. Stop that server or choose another --port-base.')
         command = server_command(self.executable, model, revision, port, kind, memory, max_model_len,
-                                 max_num_seqs=max_num_seqs, max_num_batched_tokens=max_num_batched_tokens)
+                                 max_num_seqs=max_num_seqs, max_num_batched_tokens=max_num_batched_tokens,
+                                 model_path=self.model_paths.get(model))
         self.log_dir.mkdir(parents=True, exist_ok=True)
         (self.log_dir / f'{kind}-command.json').write_text(json.dumps(command, indent=2) + '\n')
         log = (self.log_dir / f'{kind}.log').open('w')
@@ -132,7 +152,7 @@ class Servers:
         with phase as progress, httpx.Client(timeout=5, trust_env=False) as client:
             while time.monotonic() < deadline:
                 if process.poll() is not None:
-                    raise RuntimeError(f'{kind} server exited ({process.returncode}); inspect {log.name}')
+                    raise RuntimeError(server_failure(f'{kind} server exited ({process.returncode})', log.name))
                 try:
                     response = client.get(endpoint + '/v1/models')
                     if response.status_code == 200 and any(
@@ -148,7 +168,7 @@ class Servers:
                 if progress is not None:
                     progress.update(0, server=kind)
                 time.sleep(1)
-            raise TimeoutError(f'{kind} startup timed out; inspect {log.name}')
+            raise TimeoutError(server_failure(f'{kind} startup timed out', log.name))
 
     def close(self):
         stopped = []
@@ -346,7 +366,7 @@ def cached_revisions(manifest_path, models):
     cache = Path(manifest['cache_dir']) if manifest.get('cache_dir') else None
     if cache is None or not cache.is_absolute() or not cache.is_dir():
         raise ValueError('Model manifest cache_dir must name the existing absolute HF cache directory')
-    revisions = {}
+    revisions, model_paths = {}, {}
     for model in dict.fromkeys(models):
         entry = manifest['models'].get(model)
         if not isinstance(entry, dict) or not re.fullmatch('[0-9a-fA-F]{40}', str(entry.get('revision', ''))):
@@ -362,8 +382,9 @@ def cached_revisions(manifest_path, models):
             if relative.is_absolute() or '..' in relative.parts or not (Path(snapshot) / relative).is_file():
                 raise ValueError(f'Cached file {filename!r} for {model} is missing or invalid; download models again')
         revisions[model] = entry['revision']
+        model_paths[model] = str(Path(snapshot).resolve())
     model_env = {'HF_HUB_OFFLINE': '1', 'TRANSFORMERS_OFFLINE': '1', 'HF_HUB_CACHE': str(cache)}
-    return revisions, model_env
+    return revisions, model_env, model_paths
 
 
 def run_suite(args, executable, run_dir, reporter):
@@ -376,10 +397,11 @@ def run_suite(args, executable, run_dir, reporter):
     modern_runtime = check_modern_runtime(models)
     revisions = {}
     model_env = {}
+    model_paths = {}
     reused = reused_revisions(args.reuse_revisions, models) if args.reuse_revisions else None
     if args.model_manifest and models:
         with reporter.phase('Checking downloaded model snapshots', total=1, unit='manifest') as progress:
-            revisions, model_env = cached_revisions(args.model_manifest, models)
+            revisions, model_env, model_paths = cached_revisions(args.model_manifest, models)
             if reused is not None:
                 for model in models:
                     if revisions[model] != reused[model]:
@@ -395,6 +417,8 @@ def run_suite(args, executable, run_dir, reporter):
                 revisions[model] = api.model_info(model).sha
                 progress.update(1, model=model)
     config = {**vars(args), 'revisions': revisions}
+    if model_paths:
+        config['model_paths'] = model_paths
     if modern_runtime:
         config['modern_runtime'] = modern_runtime
     (run_dir / 'server-config.json').write_text(json.dumps(config, indent=2) + '\n')
@@ -433,7 +457,7 @@ def run_suite(args, executable, run_dir, reporter):
         if not set(args.methods) & {dense_name, rerank_name}:
             return
         with Servers(log_directory, executable, args.startup_timeout, args.gpu_index, reporter,
-                     model_env=model_env) as servers:
+                     model_env=model_env, model_paths=model_paths) as servers:
             embedding_url = servers.start(embedding_model, revisions[embedding_model], args.port_base + 1,
                                           'embedding', args.pool_memory, max_model_len,
                                           max_num_seqs=args.pool_max_num_seqs,
@@ -461,7 +485,7 @@ def run_suite(args, executable, run_dir, reporter):
                          args.bge_max_model_len)
     if args.ablations or set(args.methods) & {'naive-binary-vllm', 'naive-choice-vllm'}:
         with Servers(run_dir / 'servers', executable, args.startup_timeout, args.gpu_index, reporter,
-                     model_env=model_env) as servers:
+                     model_env=model_env, model_paths=model_paths) as servers:
             decision_url = servers.start(args.naive_model, revisions[args.naive_model], args.port_base,
                                          'decision', args.decision_memory, args.max_model_len,
                                          max_num_seqs=args.decision_max_num_seqs,

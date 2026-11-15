@@ -46,6 +46,26 @@ def test_server_commands_match_scoring_and_cache_contract():
             }
 
 
+@pytest.mark.parametrize('kind,model', [
+    ('decision', 'Qwen/Qwen3.5-9B'), ('decision', 'google/gemma-4-12B-it'),
+    ('decision', 'Qwen/Qwen3-8B'), ('embedding', 'BAAI/bge-m3'),
+    ('reranker', 'Qwen/Qwen3-Reranker-8B'),
+])
+def test_local_snapshot_changes_paths_without_changing_identity_or_model_profile(tmp_path, kind, model):
+    snapshot = tmp_path / 'model-snapshot'
+    baseline = runner.server_command('vllm', model, 'b' * 40, 8000, kind, .4, 8192)
+    command = runner.server_command('vllm', model, 'b' * 40, 8000, kind, .4, 8192, model_path=snapshot)
+    assert command[2] == str(snapshot)
+    assert option(command, '--tokenizer') == str(snapshot)
+    assert option(command, '--served-model-name') == model
+    assert option(command, '--revision') == option(command, '--tokenizer-revision') == 'b' * 40
+    restored = list(command)
+    restored[2] = model
+    index = restored.index('--tokenizer')
+    del restored[index:index + 2]
+    assert restored == baseline
+
+
 @pytest.mark.parametrize('kind,model', [('embedding', 'BAAI/bge-m3'),
                                        ('reranker', 'BAAI/bge-reranker-v2-m3')])
 def test_bge_servers_use_native_pooling_without_qwen_conversion(kind, model):
@@ -206,6 +226,45 @@ def test_failed_startup_cleans_owned_process_group(monkeypatch, tmp_path, gpu_in
     assert servers.processes == []
 
 
+@pytest.mark.parametrize('timeout', [False, True])
+def test_server_start_failure_includes_child_traceback_and_local_paths(monkeypatch, tmp_path, timeout):
+    model, revision = 'Qwen/Qwen3.5-9B', 'b' * 40
+    snapshot = tmp_path / 'snapshot'
+    snapshot.mkdir()
+    commands = []
+    monkeypatch.setattr(runner.socket, 'socket', lambda: Probe())
+    monkeypatch.setattr(runner.os, 'killpg', lambda *args: None)
+    def popen(command, **kwargs):
+        commands.append(command)
+        kwargs['stdout'].write('Traceback (most recent call last):\nIncompleteSnapshotError: README.md\n')
+        kwargs['stdout'].flush()
+        return Process(running=timeout)
+    monkeypatch.setattr(runner.subprocess, 'Popen', popen)
+    with pytest.raises(TimeoutError if timeout else RuntimeError) as error, runner.Servers(
+        tmp_path / 'logs', 'vllm', startup_timeout=0 if timeout else 10,
+        model_paths={model: str(snapshot)},
+    ) as servers:
+        servers.start(model, revision, 8000, 'decision', .85, 32768)
+    assert 'startup timed out' in str(error.value) if timeout else 'server exited (1)' in str(error.value)
+    assert 'IncompleteSnapshotError: README.md' in str(error.value)
+    assert str(tmp_path / 'logs/decision.log') in str(error.value)
+    assert commands[0][2] == option(commands[0], '--tokenizer') == str(snapshot)
+    assert option(commands[0], '--served-model-name') == model
+    assert not servers.processes
+
+
+def test_server_error_log_tail_is_bounded_and_handles_missing_log(tmp_path):
+    log = tmp_path / 'decision.log'
+    prefix = 'old noisy log line\n' * 3000
+    log.write_bytes(prefix.encode() + b'\xff\nRootCause: missing README.md\n')
+    message = runner.server_failure('decision server exited (1)', log)
+    assert 'RootCause: missing README.md' in message
+    assert len(message.splitlines()) <= 62
+    assert len(message) < 17000
+    log.unlink()
+    assert runner.server_failure('decision server exited (1)', log) == f'decision server exited (1); inspect {log}'
+
+
 def test_cleanup_escalates_only_owned_group_and_is_idempotent(monkeypatch, tmp_path):
     killed = []
     monkeypatch.setattr(runner.os, "killpg", lambda *args: killed.append(args))
@@ -293,8 +352,9 @@ def fake_run(monkeypatch, tmp_path):
         assert 'stdout' not in kwargs and 'stderr' not in kwargs  # keep child terminal progress live
     monkeypatch.setattr(runner.subprocess, "run", run)
     class FakeServers:
-        def __init__(self, *args, model_env=None):
+        def __init__(self, *args, model_env=None, model_paths=None):
             self.kinds = []
+            self.model_paths = model_paths or {}
             events.append(('server_gpu', args[3]))
             events.append(('server_logs', str(args[0])))
             events.append(('server_env', model_env))
@@ -307,7 +367,8 @@ def fake_run(monkeypatch, tmp_path):
             self.kinds.append(kind)
             events.append(("start", kind))
             events.append(('server_command', runner.server_command(
-                'vllm', model, revision, port, kind, memory, max_len, **kwargs)))
+                'vllm', model, revision, port, kind, memory, max_len,
+                model_path=self.model_paths.get(model), **kwargs)))
             return f"http://127.0.0.1:{port}"
 
         def __exit__(self, *args):
@@ -537,9 +598,10 @@ def test_skip_prepare_fails_before_resolution_if_dataset_file_is_missing(fake_ru
     assert not calls and not events
 
 
-def make_manifest(tmp_path):
-    models = ['Qwen/Qwen3-8B', 'Qwen/Qwen3-Embedding-8B', 'Qwen/Qwen3-Reranker-8B',
-              'BAAI/bge-m3', 'BAAI/bge-reranker-v2-m3']
+def make_manifest(tmp_path, models=None):
+    if models is None:
+        models = ['Qwen/Qwen3-8B', 'Qwen/Qwen3-Embedding-8B', 'Qwen/Qwen3-Reranker-8B',
+                  'BAAI/bge-m3', 'BAAI/bge-reranker-v2-m3']
     cache = tmp_path / 'hf-cache'
     entries = {}
     for model in models:
@@ -550,6 +612,45 @@ def make_manifest(tmp_path):
     path = tmp_path / 'manifest.json'
     path.write_text(json.dumps({'format_version': 1, 'cache_dir': str(cache), 'models': entries}))
     return path
+
+
+@pytest.mark.parametrize('model', ['Qwen/Qwen3.5-9B', 'google/gemma-4-12B-it'])
+def test_partial_inference_snapshot_is_used_directly_without_repo_lookup(fake_run, monkeypatch, tmp_path, model):
+    calls, events, _ = fake_run
+    manifest = make_manifest(tmp_path, [model])
+    snapshot = json.loads(manifest.read_text())['models'][model]['snapshot_path']
+    assert not any((Path(snapshot) / name).exists() for name in ('.gitattributes', 'README.md', 'LICENSE'))
+    monkeypatch.setitem(sys.modules, 'huggingface_hub', SimpleNamespace(
+        HfApi=lambda: pytest.fail('Validated inference snapshots must not require the rest of the repository')))
+    monkeypatch.setattr(runner.metadata, 'version', {'vllm': '0.24.0', 'transformers': '5.10.4'}.__getitem__)
+    runner.main(['scifact', '3', '--run-tag', 'local-snapshot', '--naive-model', model,
+                 '--model-manifest', str(manifest), '--methods', 'naive-binary-vllm', 'naive-choice-vllm'])
+    commands = [event[1] for event in events if event[0] == 'server_command']
+    assert len(commands) == 1
+    assert commands[0][2] == option(commands[0], '--tokenizer') == snapshot
+    assert option(commands[0], '--served-model-name') == model
+    benchmarks = [call for call in calls if 'benchmark' in call]
+    assert len(benchmarks) == 2
+    assert all(option(command, '--model') == model for command in benchmarks)
+    assert all(option(command, '--model-revision') == 'b' * 40 for command in benchmarks)
+    config = json.loads((tmp_path / 'results/local-snapshot/scifact/server-config.json').read_text())
+    assert config['model_paths'] == {model: snapshot}
+    assert config['revisions'] == {model: 'b' * 40}
+
+
+def test_actual_vllm_024_local_snapshot_resolution_when_installed(monkeypatch, tmp_path):
+    try:
+        version = runner.metadata.version('vllm')
+    except runner.metadata.PackageNotFoundError:
+        pytest.skip('vLLM is only installed on the inference server')
+    if version.split('+')[0] != '0.24.0':
+        pytest.skip('This contract targets the separately pinned modern runtime')
+    from vllm.transformers_utils import repo_utils
+    monkeypatch.setattr(repo_utils, 'hf_api', lambda: pytest.fail('Local snapshots must bypass HF snapshot_download'))
+    snapshot = tmp_path / 'inference-files-only'
+    snapshot.mkdir()
+    (snapshot / 'config.json').write_text('{}')
+    assert repo_utils.get_model_path(str(snapshot), 'b' * 40) == str(snapshot)
 
 
 @pytest.mark.parametrize('same_revision', [True, False])
@@ -581,7 +682,7 @@ def test_manifest_cache_overrides_legacy_parent_cache_in_server(monkeypatch, tmp
     legacy_names = ('TRANSFORMERS_CACHE', 'PYTORCH_TRANSFORMERS_CACHE', 'PYTORCH_PRETRAINED_BERT_CACHE')
     for name in ('HF_HUB_CACHE', *legacy_names):
         monkeypatch.setenv(name, str(tmp_path / 'wrong-cache'))
-    _, model_env = runner.cached_revisions(make_manifest(tmp_path), ['Qwen/Qwen3-8B'])
+    _, model_env, _ = runner.cached_revisions(make_manifest(tmp_path), ['Qwen/Qwen3-8B'])
     environments = []
     def popen(command, **kwargs):
         environments.append(kwargs['env'])

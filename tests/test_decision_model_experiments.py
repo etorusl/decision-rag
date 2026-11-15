@@ -97,10 +97,13 @@ def experiment(tmp_path, monkeypatch):
             return subprocess.CompletedProcess(command, 0)
         assert script == 'run_vllm_benchmark.py'  # no downloader/training subprocesses
         model = option(command, '--naive-model')
-        if state['failure_model'] == model:
-            raise subprocess.CalledProcessError(1, command)
         dataset, limit = command[2:4]
         directory = root / 'results' / option(command, '--run-tag') / dataset
+        if state['failure_model'] == model:
+            log = directory / 'servers/decision.log'
+            log.parent.mkdir(parents=True)
+            log.write_text('vLLM startup failed; preserve this traceback\n')
+            raise subprocess.CalledProcessError(1, command)
         assert not directory.exists()
         start = command.index('--methods') + 1
         end = next(index for index in range(start, len(command)) if command[index].startswith('--'))
@@ -322,3 +325,133 @@ def test_cli_uses_same_workflow_and_records_reviewable_smoke_state(experiment, c
     state = json.loads(capsys.readouterr().out)
     assert state['smoke_complete'] is True
     assert state['models'] == ['Qwen/Qwen3.5-9B', 'google/gemma-4-12B-it']
+
+
+def fail_smoke(experiment, model):
+    experiment['failure_model'] = model
+    with pytest.raises(subprocess.CalledProcessError):
+        smoke(experiment)
+    experiment['failure_model'] = None
+    experiment['calls'].clear()
+    return json.loads((experiment['destination'] / 'experiment.json').read_text())
+
+
+def test_same_command_retries_failed_smoke_preserving_previous_attempt_files(experiment):
+    model = next(iter(workflow.MODELS))
+    failed = fail_smoke(experiment, model)
+    old_directory = Path(failed['smoke_runs'][model])
+    write_json(old_directory / 'server-config.json', {'model': model, 'old_attempt': True})
+    old_files = snapshots(old_directory)
+    source_files = snapshots(experiment['source'])
+    state = smoke(experiment)
+    assert state['status'] == 'smoke_complete'
+    assert len(experiment['calls']) == 2
+    assert state['smoke_runs'] == failed['smoke_runs']
+    archive = state['smoke_failed_attempts'][0]
+    assert archive['model'] == model
+    assert Path(archive['directory']).is_relative_to(experiment['destination'] / 'failed-attempts')
+    assert snapshots(Path(archive['directory'])) == old_files
+    assert snapshots(experiment['source']) == source_files
+    assert (old_directory / 'naive-choice-vllm/summary.json').is_file()
+
+
+def test_retry_skips_validated_completed_model_then_opens_full_gate(experiment):
+    first, second = workflow.MODELS
+    failed = fail_smoke(experiment, second)
+    assert failed['smoke_completed_models'] == [first]
+    completed_files = snapshots(Path(failed['smoke_runs'][first]))
+    state = smoke(experiment)
+    assert [option(command, '--naive-model') for command, _ in experiment['calls']] == [second]
+    assert snapshots(Path(state['smoke_runs'][first])) == completed_files
+    assert state['smoke_failed_attempts'][0]['model'] == second
+    experiment['calls'].clear()
+    full = invoke(experiment, 'full')
+    assert full['status'] == 'full_complete'
+    assert not any('/failed-attempts/' in value for value in full['report_summaries'])
+
+
+@pytest.mark.parametrize('changed', ['manifest', 'manifest_path', 'data', 'source_config', 'concurrency', 'gpu'])
+def test_failed_smoke_retry_rejects_changed_inputs_without_mutating_results(experiment, changed):
+    fail_smoke(experiment, next(iter(workflow.MODELS)))
+    kwargs = {'model_manifest': experiment['manifest']}
+    if changed == 'manifest':
+        value = json.loads(experiment['manifest'].read_text())
+        value['models'][next(iter(workflow.MODELS))]['revision'] = 'c' * 40
+        write_json(experiment['manifest'], value)
+    elif changed == 'manifest_path':
+        replacement = experiment['manifest'].with_name('another-manifest.json')
+        replacement.write_bytes(experiment['manifest'].read_bytes())
+        kwargs['model_manifest'] = replacement
+    elif changed == 'data':
+        path = experiment['data'] / 'corpus.jsonl'
+        path.write_text(path.read_text().replace('Evidence', 'Changed evidence'))
+    elif changed == 'source_config':
+        write_json(experiment['source'] / 'server-config.json', dict(experiment['config'], decision_memory=.8))
+    elif changed == 'concurrency':
+        kwargs['query_concurrency'] = 4
+    else:
+        kwargs['gpu_index'] = '0'
+    prior = snapshots(experiment['destination'])
+    with pytest.raises(ValueError):
+        invoke(experiment, 'smoke', **kwargs)
+    assert snapshots(experiment['destination']) == prior
+    assert experiment['calls'] == []
+
+
+def test_retry_revalidates_completed_model_before_archiving_failed_model(experiment):
+    first, second = workflow.MODELS
+    failed = fail_smoke(experiment, second)
+    path = Path(failed['smoke_runs'][first]) / 'naive-choice-vllm/summary.json'
+    value = json.loads(path.read_text())
+    value['config']['model_revision'] = 'f' * 40
+    write_json(path, value)
+    prior = snapshots(experiment['destination'])
+    with pytest.raises(ValueError, match='model identity or revision'):
+        smoke(experiment)
+    assert snapshots(experiment['destination']) == prior
+    assert experiment['calls'] == []
+
+
+@pytest.mark.parametrize('status', ['smoke_running', 'full_running', 'full_failed', 'full_complete'])
+def test_smoke_rejects_running_and_full_stage_states_without_changes(experiment, status):
+    state = fail_smoke(experiment, next(iter(workflow.MODELS)))
+    state['status'] = status
+    write_json(experiment['destination'] / 'experiment.json', state)
+    prior = snapshots(experiment['destination'])
+    with pytest.raises(ValueError, match='Cannot retry smoke'):
+        smoke(experiment)
+    assert snapshots(experiment['destination']) == prior
+    assert experiment['calls'] == []
+
+
+def test_smoke_directory_lock_rejects_a_concurrent_retry_before_mutation(experiment):
+    fail_smoke(experiment, next(iter(workflow.MODELS)))
+    prior = snapshots(experiment['destination'])
+    with workflow._smoke_lock(experiment['destination']), pytest.raises(ValueError, match='already running'):
+        smoke(experiment)
+    assert snapshots(experiment['destination']) == prior
+    assert experiment['calls'] == []
+
+
+def test_repeating_completed_smoke_revalidates_and_returns_without_rerun(experiment):
+    first = smoke(experiment)
+    prior = snapshots(experiment['destination'])
+    experiment['calls'].clear()
+    repeated = smoke(experiment)
+    assert repeated == first
+    assert snapshots(experiment['destination']) == prior
+    assert experiment['calls'] == []
+
+
+def test_repeated_failures_preserve_each_attempt_separately(experiment):
+    model = next(iter(workflow.MODELS))
+    fail_smoke(experiment, model)
+    second = fail_smoke(experiment, model)
+    assert len(second['smoke_failed_attempts']) == 1
+    previous_archive = Path(second['smoke_failed_attempts'][0]['directory'])
+    previous_files = snapshots(previous_archive)
+    complete = smoke(experiment)
+    archives = [Path(item['directory']) for item in complete['smoke_failed_attempts']]
+    assert len(archives) == len(set(archives)) == 2
+    assert snapshots(previous_archive) == previous_files
+    assert all((directory / 'servers/decision.log').is_file() for directory in archives)

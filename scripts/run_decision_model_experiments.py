@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import importlib.util
 import json
+import os
 import re
 import subprocess
 import tempfile
 import uuid
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 from decision_rag.evaluation import file_hash
@@ -127,6 +129,88 @@ def _source_plan(source, root, concurrency, gpu_index):
                                   gpu_index=gpu_index, run_tag='experiment-validation-' + uuid.uuid4().hex, root=root)
 
 
+@contextmanager
+def _smoke_lock(experiment):
+    # A status check alone permits two retries to read smoke_failed simultaneously.
+    # Lock the directory inode so rejected retries leave every existing file intact.
+    lock = os.open(experiment, os.O_RDONLY)
+    try:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ValueError('A smoke stage is already running in this experiment directory') from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+    finally:
+        os.close(lock)
+
+
+def _run_smoke_stage(initial, experiment, config, smoke_ids, root):
+    state_path = experiment / 'experiment.json'
+    if experiment.exists() and not state_path.is_file():
+        raise ValueError(f'The smoke stage requires a fresh directory or a recorded experiment: {experiment}')
+    experiment.mkdir(parents=True, exist_ok=True)
+    with _smoke_lock(experiment):
+        if state_path.exists():
+            state = json.loads(state_path.read_text())
+            if state.get('status') not in {'smoke_failed', 'smoke_complete'}:
+                raise ValueError(f'Cannot retry smoke while experiment status is {state.get("status")!r}')
+            dynamic = {'status', 'smoke_complete', 'smoke_completed_models', 'smoke_server_versions'}
+            for key, expected in initial.items():
+                if key not in dynamic and state.get(key) != expected:
+                    raise ValueError(f'Experiment {key} changed since the first smoke attempt; use a fresh directory')
+            completed = state.get('smoke_completed_models')
+            if not isinstance(completed, list) or completed != list(MODELS)[:len(completed)]:
+                raise ValueError('Invalid completed smoke model sequence')
+            if state.get('smoke_complete') != (state['status'] == 'smoke_complete'):
+                raise ValueError('Inconsistent smoke completion state')
+            for model in completed:
+                _, versions = _validate_results(
+                    Path(state['smoke_runs'][model]), model, state['model_revisions'][model], smoke_ids,
+                    state['data_hashes'], state['query_concurrency'])
+                if versions != state.get('smoke_server_versions', {}).get(model):
+                    raise ValueError('Completed smoke server version provenance changed')
+            if state['status'] == 'smoke_complete':
+                if completed != list(MODELS):
+                    raise ValueError('Completed smoke is missing model results')
+                return state
+        else:
+            state = initial
+        state['status'] = 'smoke_running'
+        _save(state_path, state)
+        try:
+            for model, slug in MODELS.items():
+                if model in state['smoke_completed_models']:
+                    continue
+                directory = Path(state['smoke_runs'][model])
+                if directory.exists():
+                    archive = experiment / 'failed-attempts' / f'{slug}-{uuid.uuid4().hex}' / config['dataset']
+                    archive.parent.mkdir(parents=True)
+                    directory.rename(archive)
+                    state.setdefault('smoke_failed_attempts', []).append({'model': model, 'directory': str(archive)})
+                    _save(state_path, state)
+                command = _new_model_command(
+                    root, config, model, Path(state['model_manifest']), directory, SMOKE_QUERIES,
+                    state['query_concurrency'], state['gpu_index'])
+                subprocess.run(command, check=True, cwd=root)
+                _, versions = _validate_results(
+                    directory, model, state['model_revisions'][model], smoke_ids, state['data_hashes'],
+                    state['query_concurrency'])
+                state['smoke_completed_models'].append(model)
+                state['smoke_server_versions'][model] = versions
+                _save(state_path, state)
+            state.update(status='smoke_complete', smoke_complete=True)
+            _save(state_path, state)
+        except BaseException:
+            state['status'] = 'smoke_failed'
+            with suppress(Exception):
+                _save(state_path, state)
+            raise
+        return state
+
+
 def run_experiments(source_run, *, stage, experiment_dir, model_manifest=None,
                     query_concurrency=8, gpu_index='1', root=ROOT):
     root = Path(root).resolve()
@@ -156,8 +240,6 @@ def run_experiments(source_run, *, stage, experiment_dir, model_manifest=None,
     if stage == 'smoke':
         if model_manifest is None:
             raise ValueError('The smoke stage requires --model-manifest')
-        if experiment.exists():
-            raise ValueError(f'The smoke stage requires a fresh experiment directory: {experiment}')
         manifest_path = _path(model_manifest, root)
         revisions = _manifest(manifest_path)
         _python(root, True)
@@ -172,26 +254,7 @@ def run_experiments(source_run, *, stage, experiment_dir, model_manifest=None,
             'full_runs': _run_paths(experiment, dataset, 'full'),
             'smoke_completed_models': [], 'smoke_server_versions': {},
         }
-        experiment.mkdir(parents=True)
-        _save(state_path, state)
-        try:
-            for model in MODELS:
-                directory = Path(state['smoke_runs'][model])
-                command = _new_model_command(root, config, model, manifest_path, directory,
-                                             SMOKE_QUERIES, query_concurrency, gpu_index)
-                subprocess.run(command, check=True, cwd=root)
-                _, versions = _validate_results(directory, model, revisions[model], smoke_ids, hashes, query_concurrency)
-                state['smoke_completed_models'].append(model)
-                state['smoke_server_versions'][model] = versions
-                _save(state_path, state)
-            state.update(status='smoke_complete', smoke_complete=True)
-            _save(state_path, state)
-        except BaseException:
-            state['status'] = 'smoke_failed'
-            with suppress(Exception):
-                _save(state_path, state)
-            raise
-        return state
+        return _run_smoke_stage(state, experiment, config, smoke_ids, root)
     if not state_path.is_file():
         raise ValueError('Run the smoke stage in this experiment directory before the full stage')
     state = json.loads(state_path.read_text())
@@ -280,7 +343,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('source_run', help='Original results/<tag>/<dataset> directory')
     parser.add_argument('--stage', choices=['smoke', 'full'], required=True)
-    parser.add_argument('--experiment-dir', required=True, help='Fresh experiment directory under project results/')
+    parser.add_argument('--experiment-dir', required=True,
+                        help='Directory under project results/; failed smoke stages can retry in the same directory')
     parser.add_argument('--model-manifest', help='Required for smoke; full uses the recorded manifest')
     parser.add_argument('--query-concurrency', type=int, default=8)
     parser.add_argument('--gpu-index', default='1')
