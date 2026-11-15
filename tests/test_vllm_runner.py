@@ -11,6 +11,8 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from decision_rag import vllm_compat
+
 SPEC = importlib.util.spec_from_file_location(
     "vllm_runner", Path(__file__).resolve().parents[1] / "scripts" / "run_vllm_benchmark.py"
 )
@@ -107,17 +109,64 @@ def test_original_models_do_not_receive_modern_only_flags(kind, model):
 @pytest.mark.parametrize('versions', [
     {'vllm': '0.24.0', 'transformers': '5.10.4'},
     {'vllm': '0.24.0+cu129', 'transformers': '5.10.4'},
-    {'vllm': '0.25.0', 'transformers': '5.11.0'},
+    {'vllm': '0.31.0', 'transformers': '5.11.0'},
 ])
-def test_modern_runtime_accepts_supported_versions_and_cuda_wheels(monkeypatch, versions):
+def test_modern_runtime_accepts_supported_versions_and_cuda_wheels(monkeypatch, patched_vllm, versions):
     monkeypatch.setattr(runner.metadata, 'version', versions.__getitem__)
-    assert runner.check_modern_runtime(['Qwen/Qwen3.5-9B']) == versions
+    expected = dict(versions)
+    if versions['vllm'].split('+')[0] == '0.24.0':
+        expected['vllm_backport'] = vllm_compat.SWAP_FIX
+    assert runner.check_modern_runtime(['Qwen/Qwen3.5-9B']) == expected
+
+
+@pytest.fixture
+def vllm_worker_source(monkeypatch, tmp_path):
+    path = tmp_path / vllm_compat.WORKER_SOURCE
+    path.parent.mkdir(parents=True)
+    path.write_text('''class InputBatch:
+    def swap_states(self, i1, i2):
+''' + vllm_compat.UNFIXED_SWAP + '        return None\n')
+    installed = SimpleNamespace(version='0.24.0+cu129', locate_file=lambda relative: tmp_path / relative)
+    monkeypatch.setattr(runner.metadata, 'distribution', lambda _: installed)
+    return installed, path
+
+
+@pytest.fixture
+def patched_vllm(vllm_worker_source):
+    installed, _ = vllm_worker_source
+    vllm_compat.apply_batch_mask_fix(installed)
+
+
+def test_vllm_024_requires_backport_before_launch_and_records_applied_fix(monkeypatch, vllm_worker_source):
+    installed, path = vllm_worker_source
+    versions = {'vllm': installed.version, 'transformers': '5.10.4'}
+    monkeypatch.setattr(runner.metadata, 'version', versions.__getitem__)
+    with pytest.raises(RuntimeError, match=r'python -m decision_rag\.vllm_compat'):
+        runner.check_modern_runtime(['Qwen/Qwen3.5-9B'])
+    original = path.read_text()
+    assert vllm_compat.apply_batch_mask_fix(installed)
+    assert path.read_text() == original.replace(vllm_compat.UNFIXED_SWAP, vllm_compat.FIXED_SWAP)
+    assert not vllm_compat.apply_batch_mask_fix(installed)
+    assert runner.check_modern_runtime(['Qwen/Qwen3.5-9B'])['vllm_backport'] == vllm_compat.SWAP_FIX
+
+
+def test_backport_refuses_different_version_or_unrecognized_source(vllm_worker_source):
+    installed, path = vllm_worker_source
+    original = path.read_bytes()
+    with pytest.raises(RuntimeError, match='targets vLLM 0.24.0'):
+        vllm_compat.apply_batch_mask_fix(SimpleNamespace(version='0.31.0', locate_file=installed.locate_file))
+    assert path.read_bytes() == original
+    path.write_text('# different worker source\n')
+    with pytest.raises(RuntimeError, match='Unexpected vLLM'):
+        vllm_compat.apply_batch_mask_fix(installed)
+    assert path.read_text() == '# different worker source\n'
 
 
 @pytest.mark.parametrize('versions,package', [
     ({'vllm': '0.11.2', 'transformers': '5.10.4'}, 'vllm'),
     ({'vllm': '0.23.0', 'transformers': '5.10.4'}, 'vllm'),
     ({'vllm': '0.24.0rc1', 'transformers': '5.10.4'}, 'vllm'),
+    ({'vllm': '0.30.0', 'transformers': '5.10.4'}, 'vllm'),
     ({'vllm': 'invalid', 'transformers': '5.10.4'}, 'vllm'),
     ({'transformers': '5.10.4'}, 'vllm'),
     ({'vllm': '0.24.0', 'transformers': '5.10.3'}, 'transformers'),
@@ -140,7 +189,7 @@ def test_modern_runtime_rejects_unsupported_or_missing_packages_before_work(fake
 
 
 @pytest.mark.parametrize('model', ['Qwen/Qwen3.5-9B', 'google/gemma-4-12B-it'])
-def test_modern_runner_records_runtime_and_keeps_gpu_one(fake_run, monkeypatch, tmp_path, model):
+def test_modern_runner_records_runtime_and_keeps_gpu_one(fake_run, monkeypatch, tmp_path, patched_vllm, model):
     calls, events, masks = fake_run
     versions = {'vllm': '0.24.0', 'transformers': '5.10.4'}
     monkeypatch.setattr(runner.metadata, 'version', versions.__getitem__)
@@ -154,7 +203,7 @@ def test_modern_runner_records_runtime_and_keeps_gpu_one(fake_run, monkeypatch, 
     benchmarks = [call for call in calls if 'benchmark' in call]
     assert len(benchmarks) == 2 and all(option(call, '--model') == model for call in benchmarks)
     config = json.loads((tmp_path / 'results/modern/scifact/server-config.json').read_text())
-    assert config['modern_runtime'] == versions
+    assert config['modern_runtime'] == {**versions, 'vllm_backport': vllm_compat.SWAP_FIX}
 
 
 @pytest.mark.parametrize('options', [[], ['--naive-model', 'Qwen/Qwen3.5-9B', '--methods', 'bm25']])
@@ -615,7 +664,9 @@ def make_manifest(tmp_path, models=None):
 
 
 @pytest.mark.parametrize('model', ['Qwen/Qwen3.5-9B', 'google/gemma-4-12B-it'])
-def test_partial_inference_snapshot_is_used_directly_without_repo_lookup(fake_run, monkeypatch, tmp_path, model):
+def test_partial_inference_snapshot_is_used_directly_without_repo_lookup(
+    fake_run, monkeypatch, tmp_path, patched_vllm, model,
+):
     calls, events, _ = fake_run
     manifest = make_manifest(tmp_path, [model])
     snapshot = json.loads(manifest.read_text())['models'][model]['snapshot_path']

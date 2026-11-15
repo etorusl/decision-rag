@@ -15,6 +15,7 @@ python -m pip install \
   'https://github.com/vllm-project/vllm/releases/download/v0.24.0/vllm-0.24.0%2Bcu129-cp38-abi3-manylinux_2_28_x86_64.whl#sha256=597949743f2a00c0539d9e2ff0f67b32c608a378e973f99e7529fd6fa9445f70' \
   -e '.[modern-inference,data,dev]'
 python -m pip check
+python -m decision_rag.vllm_compat
 python - <<'PY'
 import os
 from importlib.metadata import version

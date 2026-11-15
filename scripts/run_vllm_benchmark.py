@@ -19,6 +19,7 @@ from pathlib import Path
 import httpx
 
 from decision_rag.observability import RunReporter, add_logging_args
+from decision_rag.vllm_compat import SWAP_FIX, require_batch_mask_fix
 
 ROOT = Path(__file__).resolve().parents[1]
 METHODS = ('bm25', 'dense-vllm', 'dense-rerank-vllm', 'dense-bge-vllm', 'dense-rerank-bge-vllm',
@@ -56,6 +57,13 @@ def check_modern_runtime(models):
         if not supported:
             raise RuntimeError(f'Modern decision models require {package}>={minimum}; found {installed}. {setup}')
         versions[package] = installed
+    vllm_version = Version(versions['vllm'])
+    if vllm_version.public == '0.24.0':
+        require_batch_mask_fix(metadata.distribution('vllm'))
+        versions['vllm_backport'] = SWAP_FIX
+    elif vllm_version < Version('0.31.0'):
+        raise RuntimeError(f'vLLM {vllm_version} predates the released batch-mask fix {SWAP_FIX}. '
+                           f'Use vLLM >=0.31.0 or the patched 0.24.0 wheel. {setup}')
     return versions
 
 
