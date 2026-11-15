@@ -30,17 +30,8 @@ RESTORE_OPTIONS = (
 )
 
 
-def plan_recovery(run_dir, *, execution_mode='throughput', query_concurrency=8, run_tag=None,
-                  gpu_index='1', model_manifest=None, root=ROOT):
+def inspect_run(run_dir, *, root=ROOT):
     root, source = Path(root).resolve(), Path(run_dir).resolve()
-    if execution_mode not in {'latency', 'throughput'}:
-        raise ValueError('execution_mode must be latency or throughput')
-    if type(query_concurrency) is not int or query_concurrency < 1:
-        raise ValueError('query_concurrency must be a positive integer')
-    if execution_mode == 'latency' and query_concurrency != 1:
-        raise ValueError('Latency recovery requires query_concurrency=1')
-    if not str(gpu_index).isascii() or not str(gpu_index).isdecimal():
-        raise ValueError('gpu_index must identify one nonnegative physical GPU')
     config_path = source / 'server-config.json'
     config = json.loads(config_path.read_text())
     if config.get('ablations'):
@@ -97,24 +88,22 @@ def plan_recovery(run_dir, *, execution_mode='throughput', query_concurrency=8, 
     plan = {'source_run': str(source), 'new_run': None, 'command': None,
             'completed_summaries': completed, 'pending_methods': pending, 'partial_methods': partial,
             'data_hash_validation': 'completed_summaries' if completed else 'unavailable'}
-    if not pending:
-        return plan
+    return config, plan
+
+
+def recovery_command(source, config, methods, *, execution_mode, query_concurrency,
+                     gpu_index, run_tag, model_manifest=None, root=ROOT):
+    config_path = source / 'server-config.json'
     revisions = config.get('revisions', {})
-    for method in pending:
+    for method in methods:
         for option in METHOD_MODELS[method]:
             model = config.get(option)
             if not isinstance(model, str) or not model:
                 raise ValueError(f'Source config lacks {option}; model identity must not be guessed')
             if not re.fullmatch('[0-9a-fA-F]{40}', str(revisions.get(model, ''))):
                 raise ValueError(f'Source config lacks an immutable revision for {model}')
-    tag = run_tag or f'{source.parent.name}-resume-c{query_concurrency}-{datetime.now(UTC):%Y%m%dT%H%M%S%fZ}'
-    if not tag or Path(tag).name != tag or tag in {'.', '..'}:
-        raise ValueError('run_tag must be one directory name')
-    destination = root / 'results' / tag / dataset
-    if destination.resolve() == source or destination.exists():
-        raise ValueError(f'Recovery requires a new output directory: {destination}')
-    command = [sys.executable, str(root / 'scripts/run_vllm_benchmark.py'), dataset, limit,
-               '--run-tag', tag, '--methods', *pending,
+    command = [sys.executable, str(root / 'scripts/run_vllm_benchmark.py'), config['dataset'], str(config['limit']),
+               '--run-tag', run_tag, '--methods', *methods,
                '--execution-mode', execution_mode, '--query-concurrency', str(query_concurrency),
                '--gpu-index', str(gpu_index), '--skip-prepare', '--reuse-revisions', str(config_path)]
     for option in RESTORE_OPTIONS:
@@ -130,6 +119,33 @@ def plan_recovery(run_dir, *, execution_mode='throughput', query_concurrency=8, 
         if not manifest_path.is_file():
             raise ValueError(f'Model manifest is missing: {manifest_path}; provide --model-manifest with its current path')
         command += ['--model-manifest', str(manifest_path.resolve())]
+    return command
+
+
+def plan_recovery(run_dir, *, execution_mode='throughput', query_concurrency=8, run_tag=None,
+                  gpu_index='1', model_manifest=None, root=ROOT):
+    root, source = Path(root).resolve(), Path(run_dir).resolve()
+    if execution_mode not in {'latency', 'throughput'}:
+        raise ValueError('execution_mode must be latency or throughput')
+    if type(query_concurrency) is not int or query_concurrency < 1:
+        raise ValueError('query_concurrency must be a positive integer')
+    if execution_mode == 'latency' and query_concurrency != 1:
+        raise ValueError('Latency recovery requires query_concurrency=1')
+    if not str(gpu_index).isascii() or not str(gpu_index).isdecimal():
+        raise ValueError('gpu_index must identify one nonnegative physical GPU')
+    config, plan = inspect_run(source, root=root)
+    pending = plan['pending_methods']
+    if not pending:
+        return plan
+    tag = run_tag or f'{source.parent.name}-resume-c{query_concurrency}-{datetime.now(UTC):%Y%m%dT%H%M%S%fZ}'
+    if not tag or Path(tag).name != tag or tag in {'.', '..'}:
+        raise ValueError('run_tag must be one directory name')
+    destination = root / 'results' / tag / config['dataset']
+    if destination.resolve() == source or destination.exists():
+        raise ValueError(f'Recovery requires a new output directory: {destination}')
+    command = recovery_command(source, config, pending, execution_mode=execution_mode,
+                               query_concurrency=query_concurrency, gpu_index=gpu_index, run_tag=tag,
+                               model_manifest=model_manifest, root=root)
     return {**plan, 'new_run': str(destination), 'command': command}
 
 

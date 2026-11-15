@@ -69,14 +69,14 @@ def experiment(tmp_path, monkeypatch):
              'queries': queries, 'config': config, 'manifest': manifest, 'revisions': revisions,
              'calls': [], 'failure_model': None, 'omit_choice': None, 'wrong_revision': None}
 
-    def result(directory, method, model, revision, count, version='0.24.0', concurrency=8):
+    def result(directory, method, model, revision, count, version='0.24.0', concurrency=8, mode='throughput'):
         selected = queries if count == 'all' else queries[:int(count)]
         write_rows(directory / method / 'queries.jsonl', [
             {'query_id': query['id'], 'conversation_id': query['conversation_id'], 'turn_id': query['turn_id']}
             for query in selected])
         write_json(directory / method / 'summary.json', {
             'quality': {'recall@10': .75}, 'latency': {'queries': len(selected), 'mean_seconds': .1},
-            'execution': {'mode': 'throughput', 'query_concurrency': concurrency},
+            'execution': {'mode': mode, 'query_concurrency': concurrency},
             'config': {'method': 'decision', 'model': model, 'model_revision': revision,
                        'retrieval': {'choice_k': 20 if method == 'naive-choice-vllm' else 0},
                        'runtime': {'server_version': version}},
@@ -189,13 +189,99 @@ def test_full_runs_legacy_choice_then_each_new_model_and_reports_full_results_on
     assert snapshots(experiment['source']) == original
 
 
-def test_smoke_may_run_before_original_binary_finishes_but_full_is_blocked(experiment):
-    (experiment['source'] / 'naive-binary-vllm/summary.json').unlink()
+def test_missing_old_results_do_not_block_full_or_restart_other_legacy_methods(experiment):
+    for method in ('naive-binary-vllm', 'dense-bge-vllm'):
+        (experiment['source'] / method / 'summary.json').unlink()
+    smoke(experiment)
+    original = snapshots(experiment['source'])
+    experiment['calls'].clear()
+    state = invoke(experiment, 'full')
+    assert state['status'] == 'full_complete'
+    assert set(state['missing_legacy_methods']) == {'naive-binary-vllm', 'dense-bge-vllm'}
+    legacy, qwen, gemma, report = [command for command, _ in experiment['calls']]
+    assert legacy[legacy.index('--methods') + 1] == 'naive-choice-vllm'
+    assert 'naive-binary-vllm' not in legacy and 'dense-bge-vllm' not in legacy
+    assert all(option(command, '--naive-model') == model
+               for command, model in zip((qwen, gemma), workflow.MODELS, strict=True))
+    assert Path(report[1]).name == 'summarize_runs.py'
+    assert snapshots(experiment['source']) == original
+
+
+def recovered_legacy(experiment, *, tag='recovered-qwen3', linked=True, choice=False, concurrency=8,
+                     mode='throughput'):
+    config = experiment['config']
+    source_config = experiment['source'] / 'server-config.json'
+    destination = experiment['root'] / 'results' / tag / 'multidoc2dial'
+    methods = ['naive-binary-vllm'] + (['naive-choice-vllm'] if choice else [])
+    write_json(destination / 'server-config.json', {
+        **config, 'methods': methods, 'reuse_revisions': str(source_config) if linked else None,
+        'execution_mode': mode, 'query_concurrency': concurrency,
+    })
+    for method in methods:
+        (experiment['source'] / method / 'summary.json').unlink(missing_ok=True)
+        experiment['result'](destination, method, config['naive_model'], config['revisions'][config['naive_model']],
+                             config['limit'], version='0.11.2', concurrency=concurrency, mode=mode)
+    return destination
+
+
+def test_full_reuses_linked_recovery_binary_without_repeating_smoke_or_modifying_results(experiment):
+    recovered = recovered_legacy(experiment)
+    smoke_state = smoke(experiment)
+    smoke_files = {model: snapshots(Path(directory)) for model, directory in smoke_state['smoke_runs'].items()}
+    original, prior_recovery = snapshots(experiment['source']), snapshots(recovered)
+    experiment['calls'].clear()
+    state = invoke(experiment, 'full')
+    assert state['status'] == 'full_complete'
+    assert not state['missing_legacy_methods']
+    assert len(experiment['calls']) == 4
+    legacy, qwen, gemma, report = [command for command, _ in experiment['calls']]
+    assert legacy[legacy.index('--methods') + 1] == 'naive-choice-vllm'
+    assert qwen[3] == gemma[3] == experiment['config']['limit']
+    recovered_summary = str(recovered / 'naive-binary-vllm/summary.json')
+    assert recovered_summary in report
+    assert recovered_summary in state['report_summaries']
+    assert str(experiment['source'] / 'naive-binary-vllm/summary.json') not in report
+    assert snapshots(experiment['source']) == original
+    assert snapshots(recovered) == prior_recovery
+    assert {model: snapshots(Path(directory)) for model, directory in state['smoke_runs'].items()} == smoke_files
+
+
+def test_cli_can_reuse_legacy_binary_and_choice_from_explicit_latency_run(experiment):
+    recovered = recovered_legacy(experiment, linked=False, choice=True, concurrency=1, mode='latency')
     smoke(experiment)
     experiment['calls'].clear()
-    with pytest.raises(ValueError, match='naive-binary'):
-        invoke(experiment, 'full')
-    assert experiment['calls'] == []
+    state = workflow.main([str(experiment['source']), '--stage', 'full',
+                           '--experiment-dir', str(experiment['destination']),
+                           '--legacy-recovery-run', str(recovered)])
+    assert state['status'] == 'full_complete'
+    assert not state['missing_legacy_methods']
+    qwen, gemma, report = [command for command, _ in experiment['calls']]
+    assert all('.venv-vllm-modern/' in command[0] for command in (qwen, gemma))
+    assert all(str(recovered / method / 'summary.json') in report for method in workflow.METHODS)
+
+
+@pytest.mark.parametrize('changed', ['revision', 'data', 'choice_k', 'query_ids'])
+def test_explicit_legacy_recovery_rejects_incompatible_binary_before_launch(experiment, changed):
+    recovered = recovered_legacy(experiment, linked=False)
+    summary = recovered / 'naive-binary-vllm/summary.json'
+    record = json.loads(summary.read_text())
+    if changed == 'revision':
+        record['config']['model_revision'] = 'f' * 40
+    elif changed == 'data':
+        record['inputs'][str(experiment['data'] / 'corpus.jsonl')] = '0' * 64
+    elif changed == 'choice_k':
+        record['config']['retrieval']['choice_k'] = 20
+    else:
+        queries = summary.with_name('queries.jsonl')
+        queries.write_text(queries.read_text().replace('"q0"', '"other"', 1))
+    write_json(summary, record)
+    smoke(experiment)
+    experiment['calls'].clear()
+    old_state = snapshots(experiment['destination'])
+    with pytest.raises(ValueError):
+        invoke(experiment, 'full', legacy_recovery_runs=[recovered])
+    assert not experiment['calls']
+    assert snapshots(experiment['destination']) == old_state
 
 
 def test_full_skips_legacy_if_original_choice_already_completed(experiment):

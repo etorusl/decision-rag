@@ -9,6 +9,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import uuid
 from contextlib import contextmanager, suppress
@@ -103,7 +104,8 @@ def _validate_results(directory, model, revision, query_ids, data_hashes, concur
                 raise ValueError('model identity or revision differs from the experiment pin')
             if config.get('retrieval', {}).get('choice_k') != choice_k:
                 raise ValueError('binary/choice scoring mode differs from the experiment')
-            if execution.get('mode') != 'throughput' or execution.get('query_concurrency') != concurrency:
+            if concurrency is not None and (execution.get('mode') != 'throughput'
+                                            or execution.get('query_concurrency') != concurrency):
                 raise ValueError('execution mode or concurrency differs from the experiment')
             for name, digest in data_hashes.items():
                 values = [value for key, value in summary.get('inputs', {}).items() if Path(key).name == name]
@@ -122,11 +124,49 @@ def _validate_results(directory, model, revision, query_ids, data_hashes, concur
     return summaries, versions
 
 
-def _source_plan(source, root, concurrency, gpu_index):
-    # Recovery only accepts a plain tag. This plan validates old results and pins;
-    # the actual legacy command receives a separately validated experiment target.
-    return RECOVERY.plan_recovery(source, execution_mode='throughput', query_concurrency=concurrency,
-                                  gpu_index=gpu_index, run_tag='experiment-validation-' + uuid.uuid4().hex, root=root)
+def _linked_recoveries(source, root):
+    source_config = source / 'server-config.json'
+    # Standard resume runs are siblings named with a timestamp. Try newer tags first.
+    for candidate in sorted((root / 'results').glob(f'*/{source.name}/server-config.json'), reverse=True):
+        if candidate.parent == source:
+            continue
+        with suppress(OSError, ValueError):
+            config = json.loads(candidate.read_text())
+            reference = config.get('reuse_revisions') if isinstance(config, dict) else None
+            if isinstance(reference, str) and reference and _path(reference, root) == source_config:
+                yield candidate.parent
+
+
+def _recover_legacy_results(source, root, config, original, explicit_runs, query_ids, hashes):
+    completed = {Path(path).parent.name: path for path in original}
+    if set(METHODS).issubset(completed):
+        return completed
+    model = config['naive_model']
+    revision = config.get('revisions', {}).get(model)
+    explicit = list(dict.fromkeys(_path(value, root) for value in explicit_runs))
+    for directory in explicit:
+        if directory.name != source.name or not any((directory / method / 'summary.json').is_file()
+                                                    for method in METHODS):
+            raise ValueError(f'No completed legacy decision result for {source.name} in {directory}')
+    for directory in [*explicit, *_linked_recoveries(source, root)]:
+        for method in METHODS:
+            if method in completed or not (directory / method / 'summary.json').is_file():
+                continue
+            if not isinstance(revision, str) or not re.fullmatch('[0-9a-fA-F]{40}', revision):
+                raise ValueError(f'Source config lacks an immutable revision for {model}')
+            try:
+                summaries, _ = _validate_results(directory, model, revision, query_ids, hashes, None,
+                                                  methods=(method,))
+            except ValueError as exc:
+                if directory in explicit:
+                    raise ValueError(f'Cannot reuse legacy result in {directory}: {exc}') from exc
+                print(f'Skipping incompatible recovery result in {directory}: {exc}', file=sys.stderr)
+                continue
+            completed[method] = summaries[0]
+            print(f'Reusing {method} from {directory}', flush=True)
+        if set(METHODS).issubset(completed):
+            break
+    return completed
 
 
 @contextmanager
@@ -212,7 +252,7 @@ def _run_smoke_stage(initial, experiment, config, smoke_ids, root):
 
 
 def run_experiments(source_run, *, stage, experiment_dir, model_manifest=None,
-                    query_concurrency=8, gpu_index='1', root=ROOT):
+                    legacy_recovery_runs=(), query_concurrency=8, gpu_index='1', root=ROOT):
     root = Path(root).resolve()
     source, experiment = _path(source_run, root), _path(experiment_dir, root)
     results = root / 'results'
@@ -224,9 +264,8 @@ def run_experiments(source_run, *, stage, experiment_dir, model_manifest=None,
         raise ValueError('gpu_index must identify one nonnegative physical GPU')
     if experiment == results or not experiment.is_relative_to(results) or experiment.is_relative_to(source):
         raise ValueError('experiment_dir must be a separate directory under project results/')
-    recovery = _source_plan(source, root, query_concurrency, gpu_index)
     config_path = source / 'server-config.json'
-    config = json.loads(config_path.read_text())
+    config, recovery = RECOVERY.inspect_run(source, root=root)
     dataset = config['dataset']
     query_path, corpus_path = (root / 'data' / dataset / name for name in ('queries.jsonl', 'corpus.jsonl'))
     queries = load_queries(query_path)
@@ -238,6 +277,8 @@ def run_experiments(source_run, *, stage, experiment_dir, model_manifest=None,
     hashes = {path.name: file_hash(path) for path in (query_path, corpus_path)}
     state_path = experiment / 'experiment.json'
     if stage == 'smoke':
+        if legacy_recovery_runs:
+            raise ValueError('--legacy-recovery-run applies only to the full stage')
         if model_manifest is None:
             raise ValueError('The smoke stage requires --model-manifest')
         manifest_path = _path(model_manifest, root)
@@ -280,40 +321,38 @@ def run_experiments(source_run, *, stage, experiment_dir, model_manifest=None,
                                         smoke_ids, hashes, query_concurrency)
         if versions != state.get('smoke_server_versions', {}).get(model):
             raise ValueError('Smoke server version provenance changed')
-    completed = recovery['completed_summaries']
-    if (not any(Path(path).parent.name == METHODS[0] for path in completed)
-            or set(recovery['pending_methods']) - {METHODS[1]}):
-        raise ValueError('Finish the original naive-binary run first; only its choice method may remain pending')
+    legacy_results = _recover_legacy_results(source, root, config, recovery['completed_summaries'],
+                                             legacy_recovery_runs, full_ids, hashes)
+    completed = list(legacy_results.values())
+    choice_method = METHODS[1]
+    missing = [method for method in RECOVERY.METHOD_MODELS
+               if method != choice_method and method not in legacy_results
+               and (method in recovery['pending_methods'] or method == METHODS[0])]
     modern_python = _python(root, True)
     legacy_directory = experiment / 'legacy-qwen3-choice' / dataset
     for directory in [Path(value) for value in state['full_runs'].values()]:
         if directory.exists():
             raise ValueError(f'Full run output already exists: {directory}')
-    legacy_command = recovery['command']
-    if legacy_command is not None:
+    legacy_command = None
+    if choice_method not in legacy_results:
         legacy_python = _python(root, False)
         if legacy_directory.exists():
             raise ValueError(f'Legacy choice output already exists: {legacy_directory}')
-        legacy_command = list(legacy_command)
+        legacy_command = RECOVERY.recovery_command(
+            source, config, (choice_method,), execution_mode='throughput', query_concurrency=query_concurrency,
+            gpu_index=gpu_index, run_tag=_tag(legacy_directory, dataset, root), root=root)
         legacy_command[0] = legacy_python
-        legacy_command[legacy_command.index('--run-tag') + 1] = _tag(legacy_directory, dataset, root)
-    state.update(status='full_running', full_completed_models=[], legacy_run=None)
+    if missing:
+        print(f'Legacy results absent from comparison: {", ".join(missing)}', file=sys.stderr, flush=True)
+    state.update(status='full_running', full_completed_models=[], legacy_run=None, missing_legacy_methods=missing)
     _save(state_path, state)
     try:
         if legacy_command is not None:
             subprocess.run(legacy_command, check=True, cwd=root)
-            # Reuse the recovery validator for query IDs, hashes and completion count.
-            legacy_recovery = _source_plan(legacy_directory, root, query_concurrency, gpu_index)
-            if legacy_recovery['pending_methods']:
-                raise ValueError('Legacy choice did not finish successfully')
-            _, legacy_versions = _validate_results(
+            summaries, _ = _validate_results(
                 legacy_directory, config['naive_model'], config['revisions'][config['naive_model']],
-                full_ids, hashes, query_concurrency, methods=('naive-choice-vllm',))
-            reference = json.loads((source / 'naive-binary-vllm/summary.json').read_text())
-            original_version = reference.get('config', {}).get('runtime', {}).get('server_version')
-            if original_version and legacy_versions['naive-choice-vllm'] != original_version:
-                raise ValueError('Original vLLM version changed between legacy binary and choice runs')
-            completed = [*completed, *legacy_recovery['completed_summaries']]
+                full_ids, hashes, query_concurrency, methods=(choice_method,))
+            completed.extend(summaries)
             state['legacy_run'] = str(legacy_directory)
             _save(state_path, state)
         for model in MODELS:
@@ -346,11 +385,14 @@ def main(argv=None):
     parser.add_argument('--experiment-dir', required=True,
                         help='Directory under project results/; failed smoke stages can retry in the same directory')
     parser.add_argument('--model-manifest', help='Required for smoke; full uses the recorded manifest')
+    parser.add_argument('--legacy-recovery-run', dest='legacy_recovery_runs', action='append', default=[],
+                        help='Additional legacy results/<tag>/<dataset> directory to reuse in full (repeatable)')
     parser.add_argument('--query-concurrency', type=int, default=8)
     parser.add_argument('--gpu-index', default='1')
     args = parser.parse_args(argv)
     state = run_experiments(args.source_run, stage=args.stage, experiment_dir=args.experiment_dir,
-                            model_manifest=args.model_manifest, query_concurrency=args.query_concurrency,
+                            model_manifest=args.model_manifest, legacy_recovery_runs=args.legacy_recovery_runs,
+                            query_concurrency=args.query_concurrency,
                             gpu_index=args.gpu_index, root=ROOT)
     print(json.dumps(state, ensure_ascii=False, indent=2))
     return state
