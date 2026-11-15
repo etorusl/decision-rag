@@ -29,6 +29,22 @@ def test_prefetch_selects_one_weight_format_and_retains_tokenizer_and_pooling_co
     assert fmt == 'pytorch' and 'pytorch_model.bin' in files
 
 
+@pytest.mark.parametrize('names', [
+    # Official Qwen3.5-9B file layout: the shard names include "model.safetensors-".
+    ['config.json', 'chat_template.jinja', 'merges.txt', 'vocab.json', 'tokenizer.json',
+     'tokenizer_config.json', 'preprocessor_config.json', 'video_preprocessor_config.json',
+     'model.safetensors.index.json',
+     *[f'model.safetensors-{index:05d}-of-00004.safetensors' for index in range(1, 5)]],
+    # Gemma 4 keeps its text/tokenizer and multimodal processor metadata in JSON.
+    ['config.json', 'generation_config.json', 'processor_config.json', 'tokenizer.json',
+     'tokenizer_config.json', 'model.safetensors'],
+])
+def test_new_decision_model_layouts_retain_all_weights_templates_and_processor_metadata(names):
+    files, fmt = download.model_files(siblings(*names, 'README.md', 'onnx/model.onnx'))
+    assert fmt == 'safetensors'
+    assert set(files) == set(names)
+
+
 @pytest.fixture
 def fake_hub(monkeypatch, tmp_path):
     state = {'main': 'a' * 40, 'info': [], 'downloads': [], 'fail': None, 'omit': None}
@@ -102,4 +118,66 @@ def test_default_download_command_includes_all_five_models(monkeypatch, capsys):
     download.main([])
     assert calls == ['Qwen/Qwen3-8B', 'Qwen/Qwen3-Embedding-8B', 'Qwen/Qwen3-Reranker-8B',
                      'BAAI/bge-m3', 'BAAI/bge-reranker-v2-m3']
+    assert set(json.loads(capsys.readouterr().out)['models']) == set(calls)
+
+
+def test_explicit_model_list_uses_its_own_manifest_and_ignores_suite_environment(fake_hub, tmp_path, monkeypatch, capsys):
+    baseline = tmp_path / 'baseline-manifest.json'
+    download.download_models(['Qwen/Qwen3-8B'], baseline, progress='off')
+    original = baseline.read_bytes()
+    fake_hub['info'].clear()
+    fake_hub['downloads'].clear()
+    monkeypatch.setenv('NAIVE_MODEL', 'unrequested/naive-model')
+    monkeypatch.setenv('EMBEDDING_MODEL', 'unrequested/embedding-model')
+    monkeypatch.setenv('RERANKER_MODEL', 'unrequested/reranker-model')
+    manifest = tmp_path / 'new-decision-models.json'
+    models = ['Qwen/Qwen3.5-9B', 'google/gemma-4-12B']
+    command = ['--models', *models, '--manifest', str(manifest), '--progress', 'off']
+    download.main(command)
+    assert [model for model, _ in fake_hub['info']] == models
+    assert [call['repo_id'] for call in fake_hub['downloads']] == models
+    saved = json.loads(manifest.read_text())
+    assert list(saved['models']) == models
+    assert baseline.read_bytes() == original
+    result = json.loads(capsys.readouterr().out)
+    assert result['manifest'] == str(manifest.resolve())
+    assert result['models'] == dict.fromkeys(models, 'a' * 40)
+    fake_hub['main'] = 'b' * 40
+    download.main(command)
+    assert fake_hub['info'][-2:] == [(model, 'a' * 40) for model in models]
+    assert baseline.read_bytes() == original
+
+
+@pytest.mark.parametrize('conflicting', [
+    ['--skip-bge'], ['--naive-model', 'org/naive'], ['--embedding-model', 'org/embed'],
+    ['--reranker-model', 'org/rerank'], ['--bge-embedding-model', 'org/bge-embed'],
+    ['--bge-reranker-model', 'org/bge-rerank'],
+])
+def test_explicit_model_list_rejects_ambiguous_suite_options_before_downloading(monkeypatch, conflicting, capsys):
+    monkeypatch.setattr(download, 'download_models', lambda *args, **kwargs: pytest.fail('must not download'))
+    with pytest.raises(SystemExit) as exc:
+        download.main(['--models', 'Qwen/Qwen3.5-9B', *conflicting])
+    assert exc.value.code == 2
+    assert '--models cannot be combined' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('models', [[], [''], ['   ']])
+def test_explicit_model_list_requires_nonempty_ids(monkeypatch, models):
+    monkeypatch.setattr(download, 'download_models', lambda *args, **kwargs: pytest.fail('must not download'))
+    with pytest.raises(SystemExit) as exc:
+        download.main(['--models', *models])
+    assert exc.value.code == 2
+
+
+def test_default_role_options_and_environment_still_apply_without_explicit_list(monkeypatch, capsys):
+    calls = []
+    def fake(models, *args, **kwargs):
+        calls.extend(models)
+        return {'models': {model: {'revision': 'a' * 40} for model in models}}
+    monkeypatch.setattr(download, 'download_models', fake)
+    monkeypatch.setenv('NAIVE_MODEL', 'custom/naive')
+    monkeypatch.setenv('EMBEDDING_MODEL', 'custom/embedding-from-env')
+    monkeypatch.setenv('RERANKER_MODEL', 'custom/reranker')
+    download.main(['--embedding-model', 'custom/embedding-override', '--skip-bge'])
+    assert calls == ['custom/naive', 'custom/embedding-override', 'custom/reranker']
     assert set(json.loads(capsys.readouterr().out)['models']) == set(calls)

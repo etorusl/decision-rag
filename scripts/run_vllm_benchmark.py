@@ -13,6 +13,7 @@ import sys
 import time
 from contextlib import nullcontext
 from datetime import UTC, datetime
+from importlib import metadata
 from pathlib import Path
 
 import httpx
@@ -26,6 +27,36 @@ RERANK_OVERRIDES = {
     'architectures': ['Qwen3ForSequenceClassification'],
     'classifier_from_token': ['no', 'yes'], 'is_original_qwen3_reranker': True,
 }
+MODERN_DECISION_PROFILES = {
+    'Qwen/Qwen3.5-9B': ('--language-model-only', '--mamba-cache-mode', 'align', '--enable-chunked-prefill'),
+    'google/gemma-4-12B-it': ('--language-model-only',),
+}
+MODERN_MINIMUM_VERSIONS = {'vllm': '0.24.0', 'transformers': '5.10.4'}
+
+
+def check_modern_runtime(models):
+    """Fail before downloads or GPU work when a selected checkpoint needs newer vLLM."""
+    if not set(models) & MODERN_DECISION_PROFILES.keys():
+        return {}
+    setup = 'Run scripts/setup_vllm_modern_h100.sh, then use .venv-vllm-modern/bin/python'
+    try:
+        from packaging.version import InvalidVersion, Version
+    except ImportError as exc:
+        raise RuntimeError(f'Modern decision models require the modern inference environment. {setup}') from exc
+    versions = {}
+    for package, minimum in MODERN_MINIMUM_VERSIONS.items():
+        try:
+            installed = metadata.version(package)
+        except metadata.PackageNotFoundError as exc:
+            raise RuntimeError(f'Modern decision models require {package}>={minimum}; it is not installed. {setup}') from exc
+        try:
+            supported = Version(installed) >= Version(minimum)
+        except InvalidVersion as exc:
+            raise RuntimeError(f'Cannot validate installed {package} version {installed!r}. {setup}') from exc
+        if not supported:
+            raise RuntimeError(f'Modern decision models require {package}>={minimum}; found {installed}. {setup}')
+        versions[package] = installed
+    return versions
 
 
 def server_command(executable, model, revision, port, kind, memory, max_model_len, *,
@@ -44,6 +75,9 @@ def server_command(executable, model, revision, port, kind, memory, max_model_le
                '--generation-config', 'vllm', '--enable-prompt-tokens-details']
     if kind == 'decision':
         command += ['--logprobs-mode', 'processed_logprobs', '--max-logprobs', '26', '--enable-prefix-caching']
+        # Qwen3.5's hybrid attention needs aligned recurrent-state caching and chunked prefill.
+        # Gemma4 chooses its attention backend internally; retain that hardware-aware selection.
+        command += MODERN_DECISION_PROFILES.get(model, ())
     else:
         command += ['--no-enable-prefix-caching']
         if model.rsplit('/', 1)[-1].lower() in {'bge-m3', 'bge-reranker-v2-m3'}:
@@ -247,6 +281,8 @@ def main(argv=None):
         parser.error('Ablations require a structured paper dataset')
     executable = Path(sys.executable).parent / 'vllm'
     if not executable.exists():
+        if set(required_models(args)) & MODERN_DECISION_PROFILES.keys():
+            parser.error('Run scripts/setup_vllm_modern_h100.sh, then use .venv-vllm-modern/bin/python')
         parser.error('Run setup_vllm_h100.sh, then use .venv-vllm/bin/python')
     os.chdir(ROOT)
     tag = args.run_tag or datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')
@@ -337,6 +373,7 @@ def run_suite(args, executable, run_dir, reporter):
             if not path.is_file():
                 raise ValueError(f'--skip-prepare requires existing dataset file: {path}')
     models = required_models(args)
+    modern_runtime = check_modern_runtime(models)
     revisions = {}
     model_env = {}
     reused = reused_revisions(args.reuse_revisions, models) if args.reuse_revisions else None
@@ -357,7 +394,10 @@ def run_suite(args, executable, run_dir, reporter):
             for model in dict.fromkeys(models):
                 revisions[model] = api.model_info(model).sha
                 progress.update(1, model=model)
-    (run_dir / 'server-config.json').write_text(json.dumps({**vars(args), 'revisions': revisions}, indent=2) + '\n')
+    config = {**vars(args), 'revisions': revisions}
+    if modern_runtime:
+        config['modern_runtime'] = modern_runtime
+    (run_dir / 'server-config.json').write_text(json.dumps(config, indent=2) + '\n')
     cli = [sys.executable, '-m', 'decision_rag']
     def run(*command, use_cached_models=False):
         subprocess.run([str(x) for x in command], check=True,

@@ -1,10 +1,11 @@
-"""One-token decisions through a local vLLM 0.11.2-compatible HTTP server.
+"""One-token decisions through a local vLLM-compatible HTTP server.
 
 The server batches independent requests and may reuse their common KV prefix. This
 is inference of an existing causal LM, not the custom packed decision-head runtime.
 """
 from __future__ import annotations
 
+import hashlib
 import math
 import string
 import uuid
@@ -71,11 +72,6 @@ class VLLMDecisionBackend:
         self.cache_policy, self.prime_prefix = cache_policy, prime_prefix
         self._cache_salt = uuid.uuid4().hex if cache_policy == "per-query" else None
         self._owns_client = client is None
-        self.client = client or httpx.Client(
-            timeout=timeout, trust_env=False,
-            headers={"Authorization": f"Bearer {api_key}"} if api_key else None,
-            limits=httpx.Limits(max_connections=max(concurrency, 4), max_keepalive_connections=max(concurrency, 4)),
-        )
         if tokenizer is None:
             from transformers import AutoTokenizer
 
@@ -83,6 +79,13 @@ class VLLMDecisionBackend:
                 tokenizer_name or model_name, revision=tokenizer_revision, trust_remote_code=False,
             )
         self.tokenizer = tokenizer
+        chat_template = getattr(tokenizer, "chat_template", None)
+        if hasattr(tokenizer, "chat_template") and not chat_template:
+            raise ValueError(
+                f"Tokenizer {tokenizer_name or model_name!r} has no chat template. "
+                "Naive decisions require an instruction-tuned model and its matching tokenizer "
+                "(for Gemma 4 use google/gemma-4-12B-it)."
+            )
         self.label_ids = self._single_token_ids(["no", "yes"])
         self.name = f"vllm-logits:{self.served_model_name}"
         self.runtime_metadata = {
@@ -91,9 +94,22 @@ class VLLMDecisionBackend:
             "tokenizer_revision": tokenizer_revision, "cache_policy": cache_policy,
             "prefix_priming": prime_prefix, "http_batch_size": batch_size,
             "http_concurrency": concurrency, "scoring": "one-token-restricted-logprobs",
+            "prompt_format": "tokenizer-chat-template", "thinking_disabled": True,
+            "add_special_tokens": False,
+            "binary_label_token_ids": dict(zip(("no", "yes"), self.label_ids, strict=True)),
+            "chat_template_sha256": (
+                hashlib.sha256(chat_template.encode("utf-8")).hexdigest()
+                if isinstance(chat_template, str) else None
+            ),
             "physical_forward_passes": "not observable from HTTP responses",
             "server_verified": False,
         }
+        # Validate the tokenizer before opening an owned HTTP connection pool.
+        self.client = client or httpx.Client(
+            timeout=timeout, trust_env=False,
+            headers={"Authorization": f"Bearer {api_key}"} if api_key else None,
+            limits=httpx.Limits(max_connections=max(concurrency, 4), max_keepalive_connections=max(concurrency, 4)),
+        )
         try:
             if verify_server:
                 self._verify_server()

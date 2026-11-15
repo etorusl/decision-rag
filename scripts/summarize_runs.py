@@ -69,6 +69,7 @@ def model_identity(config):
         if identity['checkpoint']:
             description += f"; checkpoint: {identity['checkpoint']}"
     elif method == 'bm25':
+        identity['engine'] = 'bm25'
         run_type, description = 'BM25', 'BM25 — no neural model'
     else:
         run_type, description = method, f'{method} — model unknown'
@@ -100,6 +101,7 @@ def flatten_summary(path):
     latency, work = data["latency"], data.get("work", {})
     count = latency.get("queries", 0)
     config = data.get("config", {})
+    runtime = config.get('runtime', {})
     execution = data.get('execution', {})
     throughput = data.get('throughput', {})
     search = config.get('runtime', {}).get('search_runtime', {})
@@ -110,6 +112,7 @@ def flatten_summary(path):
     row = {
         "run": str(path.parent),
         **model_identity(config),
+        "vllm_server_version": runtime.get('server_version') or runtime.get('embedding', {}).get('server_version', ''),
         "execution_mode": execution.get('mode', 'latency'),
         "query_concurrency": execution.get('query_concurrency', 1),
         "effective_query_concurrency": execution.get('effective_query_concurrency', 1),
@@ -252,6 +255,7 @@ def markdown_text(rows):
                 ("warmup_queries", "Warmups"),
                 ("gpu", "GPU"),
                 ("engine", "Inference engine"),
+                ("vllm_server_version", "vLLM server version"),
                 ("effective_query_concurrency", "Workers"),
                 ("search_device", "Search device"),
                 ("search_precision", "Search precision"),

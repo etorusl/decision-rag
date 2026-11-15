@@ -146,6 +146,22 @@ def test_concurrent_report_keeps_wall_throughput_distinct_from_serial_qps(tmp_pa
     assert legacy['throughput.queries_per_second'] is None
 
 
+def test_report_records_actual_server_version_separately_from_client_environment(tmp_path):
+    path = write_summary(tmp_path / 'new-model/naive-binary-vllm')
+    summary = json.loads(path.read_text())
+    summary['config'] = {'method': 'decision', 'backend': 'vllm-logits:Qwen/Qwen3.5-9B',
+                         'model': 'Qwen/Qwen3.5-9B', 'retrieval': {'choice_k': 0},
+                         'runtime': {'runtime': 'vllm-http', 'server_version': '0.24.0'}}
+    summary['environment']['packages'] = {'vllm': '0.11.2'}
+    path.write_text(json.dumps(summary))
+    row = reporter.flatten_summary(path)
+    assert row['vllm_server_version'] == '0.24.0'
+    text = reporter.markdown_text([row])
+    assert 'vLLM server version' in text and '0.24.0' in text
+    assert 'Qwen/Qwen3.5-9B' in text
+    assert reporter.model_identity({'method': 'bm25', 'engine': 'vllm'})['engine'] == 'bm25'
+
+
 @pytest.mark.parametrize('choice_k,run_type', [(0, 'naive binary'), (20, 'naive choice')])
 def test_decision_rows_include_actual_model_in_every_table_and_csv(tmp_path, choice_k, run_type):
     source = write_summary(tmp_path / 'pages-3')

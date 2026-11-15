@@ -59,6 +59,90 @@ def test_bge_servers_use_native_pooling_without_qwen_conversion(kind, model):
     assert '--enforce-eager' not in command
 
 
+@pytest.mark.parametrize('model,extra', [
+    ('Qwen/Qwen3.5-9B', ['--language-model-only', '--mamba-cache-mode', 'align', '--enable-chunked-prefill']),
+    ('google/gemma-4-12B-it', ['--language-model-only']),
+])
+def test_modern_profiles_preserve_decision_scoring_and_add_only_required_model_flags(model, extra):
+    baseline = runner.server_command('vllm', 'Qwen/Qwen3-8B', 'a' * 40, 8000, 'decision', .85, 32768)
+    command = runner.server_command('vllm', model, 'a' * 40, 8000, 'decision', .85, 32768)
+    assert command == [model if item == 'Qwen/Qwen3-8B' else item for item in baseline] + extra
+    assert '--attention-backend' not in command
+    assert '--speculative-config' not in command
+    assert '--hf-overrides' not in command
+
+
+@pytest.mark.parametrize('kind,model', [
+    ('decision', 'Qwen/Qwen3-8B'), ('embedding', 'Qwen/Qwen3-Embedding-8B'),
+    ('reranker', 'Qwen/Qwen3-Reranker-8B'), ('embedding', 'BAAI/bge-m3'),
+    ('reranker', 'BAAI/bge-reranker-v2-m3'),
+])
+def test_original_models_do_not_receive_modern_only_flags(kind, model):
+    command = runner.server_command('vllm', model, 'a' * 40, 8000, kind, .4, 8192)
+    assert '--language-model-only' not in command
+    assert '--mamba-cache-mode' not in command
+    assert '--enable-chunked-prefill' not in command
+
+
+@pytest.mark.parametrize('versions', [
+    {'vllm': '0.24.0', 'transformers': '5.10.4'},
+    {'vllm': '0.24.0+cu129', 'transformers': '5.10.4'},
+    {'vllm': '0.25.0', 'transformers': '5.11.0'},
+])
+def test_modern_runtime_accepts_supported_versions_and_cuda_wheels(monkeypatch, versions):
+    monkeypatch.setattr(runner.metadata, 'version', versions.__getitem__)
+    assert runner.check_modern_runtime(['Qwen/Qwen3.5-9B']) == versions
+
+
+@pytest.mark.parametrize('versions,package', [
+    ({'vllm': '0.11.2', 'transformers': '5.10.4'}, 'vllm'),
+    ({'vllm': '0.23.0', 'transformers': '5.10.4'}, 'vllm'),
+    ({'vllm': '0.24.0rc1', 'transformers': '5.10.4'}, 'vllm'),
+    ({'vllm': 'invalid', 'transformers': '5.10.4'}, 'vllm'),
+    ({'transformers': '5.10.4'}, 'vllm'),
+    ({'vllm': '0.24.0', 'transformers': '5.10.3'}, 'transformers'),
+    ({'vllm': '0.24.0', 'transformers': '5.10.4rc1'}, 'transformers'),
+    ({'vllm': '0.24.0'}, 'transformers'),
+])
+def test_modern_runtime_rejects_unsupported_or_missing_packages_before_work(fake_run, monkeypatch, versions, package):
+    calls, events, _ = fake_run
+    def version(name):
+        if name not in versions:
+            raise runner.metadata.PackageNotFoundError(name)
+        return versions[name]
+    monkeypatch.setattr(runner.metadata, 'version', version)
+    monkeypatch.setitem(sys.modules, 'huggingface_hub', SimpleNamespace(
+        HfApi=lambda: pytest.fail('Validate the modern runtime before resolving model revisions')))
+    with pytest.raises(RuntimeError, match=package + '.*setup_vllm_modern_h100.sh'):
+        runner.main(['scifact', '3', '--run-tag', 'unsupported-modern', '--naive-model', 'Qwen/Qwen3.5-9B',
+                     '--methods', 'naive-binary-vllm'])
+    assert not calls and not events
+
+
+@pytest.mark.parametrize('model', ['Qwen/Qwen3.5-9B', 'google/gemma-4-12B-it'])
+def test_modern_runner_records_runtime_and_keeps_gpu_one(fake_run, monkeypatch, tmp_path, model):
+    calls, events, masks = fake_run
+    versions = {'vllm': '0.24.0', 'transformers': '5.10.4'}
+    monkeypatch.setattr(runner.metadata, 'version', versions.__getitem__)
+    runner.main(['scifact', '3', '--run-tag', 'modern', '--naive-model', model,
+                 '--methods', 'naive-binary-vllm', 'naive-choice-vllm'])
+    commands = [event[1] for event in events if event[0] == 'server_command']
+    assert len(commands) == 1 and commands[0][2] == model
+    assert '--language-model-only' in commands[0]
+    assert [event for event in events if event[0] == 'server_gpu'] == [('server_gpu', '1')]
+    assert masks and set(masks) == {'1'}
+    benchmarks = [call for call in calls if 'benchmark' in call]
+    assert len(benchmarks) == 2 and all(option(call, '--model') == model for call in benchmarks)
+    config = json.loads((tmp_path / 'results/modern/scifact/server-config.json').read_text())
+    assert config['modern_runtime'] == versions
+
+
+@pytest.mark.parametrize('options', [[], ['--naive-model', 'Qwen/Qwen3.5-9B', '--methods', 'bm25']])
+def test_old_models_and_unused_modern_model_do_not_trigger_runtime_guard(fake_run, monkeypatch, options):
+    monkeypatch.setattr(runner.metadata, 'version', lambda name: pytest.fail('Unneeded version lookup'))
+    runner.main(['scifact', '3', '--run-tag', 'legacy-runtime', *options])
+
+
 class Probe:
     def __init__(self, occupied=False):
         self.occupied = occupied

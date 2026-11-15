@@ -107,17 +107,28 @@ def main(argv=None):
     parser.add_argument('--cache-dir', help='Hugging Face cache directory; defaults to HF_HUB_CACHE/HF_HOME')
     parser.add_argument('--refresh', action='store_true', help='Resolve new model revisions instead of reusing saved pins')
     parser.add_argument('--max-workers', type=int, default=8)
-    parser.add_argument('--naive-model', default=os.getenv('NAIVE_MODEL', 'Qwen/Qwen3-8B'))
-    parser.add_argument('--embedding-model', default=os.getenv('EMBEDDING_MODEL', 'Qwen/Qwen3-Embedding-8B'))
-    parser.add_argument('--reranker-model', default=os.getenv('RERANKER_MODEL', 'Qwen/Qwen3-Reranker-8B'))
-    parser.add_argument('--bge-embedding-model', default='BAAI/bge-m3')
-    parser.add_argument('--bge-reranker-model', default='BAAI/bge-reranker-v2-m3')
+    parser.add_argument('--models', nargs='+', metavar='MODEL',
+                        help='Download exactly these model IDs instead of the default benchmark suite')
+    role_defaults = {
+        'naive_model': os.getenv('NAIVE_MODEL', 'Qwen/Qwen3-8B'),
+        'embedding_model': os.getenv('EMBEDDING_MODEL', 'Qwen/Qwen3-Embedding-8B'),
+        'reranker_model': os.getenv('RERANKER_MODEL', 'Qwen/Qwen3-Reranker-8B'),
+        'bge_embedding_model': 'BAAI/bge-m3', 'bge_reranker_model': 'BAAI/bge-reranker-v2-m3',
+    }
+    for role, default in role_defaults.items():
+        parser.add_argument('--' + role.replace('_', '-'), help=f'Default benchmark suite model (default: {default})')
     parser.add_argument('--skip-bge', action='store_true', help='Download only the original Qwen suite')
     add_logging_args(parser)
     args = parser.parse_args(argv)
-    models = [args.naive_model, args.embedding_model, args.reranker_model]
-    if not args.skip_bge:
-        models += [args.bge_embedding_model, args.bge_reranker_model]
+    if args.models is not None:
+        if args.skip_bge or any(getattr(args, role) is not None for role in role_defaults):
+            parser.error('--models cannot be combined with --skip-bge or role-specific model options')
+        models = args.models
+    else:
+        models = [getattr(args, role) if getattr(args, role) is not None else default
+                  for role, default in role_defaults.items() if not (args.skip_bge and role.startswith('bge_'))]
+    if any(not model.strip() for model in models):
+        parser.error('Model identifiers must not be empty')
     manifest = download_models(models, args.manifest, cache_dir=args.cache_dir, refresh=args.refresh,
                                max_workers=args.max_workers, progress=args.progress, log_interval=args.log_interval)
     print(json.dumps({'manifest': str(Path(args.manifest).resolve()),

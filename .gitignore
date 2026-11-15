@@ -17,3 +17,5 @@ environment-h100.txt
 
 .venv-vllm/
 environment-vllm-h100.txt
+.venv-vllm-modern/
+environment-vllm-modern-h100.txt

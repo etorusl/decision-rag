@@ -1,3 +1,5 @@
+import hashlib
+import importlib.metadata
 import json
 import math
 
@@ -142,6 +144,95 @@ def test_server_info_not_required_in_production():
     model, _ = backend(server)
     assert model.runtime_metadata['server_config_available'] is False
     assert model.binary('c',['q']).probabilities == pytest.approx([2/3])
+
+
+@pytest.mark.parametrize("template", [None, ""])
+def test_missing_chat_template_fails_before_opening_owned_client(monkeypatch, template):
+    tokenizer = TinyTokenizer()
+    tokenizer.chat_template = template
+
+    def unexpected_client(**kwargs):
+        pytest.fail("A model with no chat template must fail before opening a client")
+
+    monkeypatch.setattr(httpx, "Client", unexpected_client)
+    with pytest.raises(ValueError, match="no chat template.*instruction-tuned.*gemma-4-12B-it"):
+        VLLMDecisionBackend(model_name="google/gemma-4-12B", tokenizer=tokenizer, verify_server=False)
+
+
+@pytest.mark.parametrize("method", ["binary", "choice"])
+def test_template_owned_bos_and_closed_thinking_channel_reach_raw_completions_once(method):
+    class GemmaStyleTokenizer(TinyTokenizer):
+        # Exercise the same BOS and generation suffix as Gemma 4's official
+        # template, without downloading model assets in the unit suite.
+        chat_template = "template supplies BOS and a closed thinking channel"
+        bos_token_id = 2
+
+        def encode(self, text, add_special_tokens=False):
+            result = [self.bos_token_id] if add_special_tokens else []
+            for i, part in enumerate(text.split("<bos>")):
+                if i:
+                    result.append(self.bos_token_id)
+                result.extend(super().encode(part, add_special_tokens=False))
+            return result
+
+        def apply_chat_template(self, messages, **kwargs):
+            assert kwargs == {"tokenize": False, "add_generation_prompt": True, "enable_thinking": False}
+            return ("<bos><|turn>user\n" + messages[0]["content"] + "<turn|>\n"
+                    "<|turn>model\n<|channel>thought\n<channel|>")
+
+    tokenizer = GemmaStyleTokenizer()
+    server = LocalServer()
+    server.model_id = "google/gemma-4-12B-it"
+    server.server_info = False
+    with httpx.Client(transport=httpx.MockTransport(server)) as client:
+        model = VLLMDecisionBackend(
+            model_name=server.model_id, tokenizer=tokenizer, client=client, prime_prefix=False,
+        )
+        if method == "binary":
+            model.binary("context", ["first?", "second?"])
+        else:
+            model.choice("context", "Which?", ["first", "second"])
+        payload = completions(server)[0]
+        suffix = tokenizer.encode("<|turn>model\n<|channel>thought\n<channel|>")
+        for prompt in payload["prompt"]:
+            assert prompt[0] == tokenizer.bos_token_id
+            assert prompt.count(tokenizer.bos_token_id) == 1
+            assert prompt[-len(suffix):] == suffix
+        assert payload["add_special_tokens"] is False
+        assert model.runtime_metadata["prompt_format"] == "tokenizer-chat-template"
+        assert model.runtime_metadata["thinking_disabled"] is True
+        assert model.runtime_metadata["binary_label_token_ids"] == {"no": 10, "yes": 11}
+        assert model.runtime_metadata["chat_template_sha256"] == hashlib.sha256(
+            tokenizer.chat_template.encode("utf-8")
+        ).hexdigest()
+
+
+def test_actual_vllm_024_completion_protocol_when_installed():
+    """Optional HTTP-protocol contract check inside the modern server environment."""
+    try:
+        version = importlib.metadata.version("vllm")
+    except importlib.metadata.PackageNotFoundError:
+        pytest.skip("vLLM is only installed on the inference server")
+    if version.split("+")[0] != "0.24.0":
+        pytest.skip("This constructor contract targets the separately pinned modern runtime")
+    from typing import get_args
+
+    from vllm.config.model import LogprobsMode
+    from vllm.entrypoints.openai.completion.protocol import CompletionRequest
+
+    model, server = backend(prime_prefix=False)
+    model.binary("context", ["q1", "q2"])
+    payload = completions(server)[0]
+    request = CompletionRequest(**payload)
+    sampling = request.to_sampling_params(max_tokens=1)
+    assert request.prompt == payload["prompt"]
+    assert request.cache_salt == payload["cache_salt"]
+    assert request.return_tokens_as_token_ids is True
+    assert request.add_special_tokens is False
+    assert sampling.allowed_token_ids == [10, 11]
+    assert sampling.logprobs == 2
+    assert sampling.min_tokens == sampling.max_tokens == 1
+    assert "processed_logprobs" in get_args(LogprobsMode)
 
 
 def test_wrong_probability_mode_detected_before_scoring():
